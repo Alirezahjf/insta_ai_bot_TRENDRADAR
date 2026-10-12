@@ -1,7 +1,116 @@
-"""اتصال به AvalAI (سازگار با OpenAI) + ساخت پرامپت تحلیل وایرال"""
+"""اتصال به AvalAI (سازگار با OpenAI) + تحلیل و گسترش کلیدواژه‌های جست‌وجو"""
+import json
+import re
+
 import config
 
 _client = None
+
+_TERM_SEPARATORS = re.compile(r"[\s-]+")
+_TERM_INVALID = re.compile(r"[^\w\u0600-\u06FF\u0750-\u077F]+", re.UNICODE)
+_AR_TO_FA = str.maketrans({
+    "ي": "ی", "ك": "ک", "ﻻ": "لا", "ة": "ه",
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ؤ": "و", "ئ": "ی",
+})
+
+
+def normalize_search_keyword(value):
+    """یک عبارت را به شکل مناسب هشتگ Instagram/Telegram نرمال می‌کند."""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().lstrip("#").casefold().translate(_AR_TO_FA)
+    value = value.replace("\u200c", " ").replace("\u200f", " ").replace("\u200e", " ")
+    value = _TERM_SEPARATORS.sub("_", value)
+    value = _TERM_INVALID.sub("", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value if 2 <= len(value) <= 64 else ""
+
+
+def _unique_search_keywords(values, *, excluded=(), limit=5):
+    blocked = {normalize_search_keyword(x) for x in excluded}
+    blocked.discard("")
+    out = []
+    for value in values or []:
+        term = normalize_search_keyword(value)
+        if not term or term in blocked:
+            continue
+        blocked.add(term)
+        out.append(term)
+        if len(out) >= max(0, int(limit)):
+            break
+    return out
+
+
+def _parse_keyword_response(text):
+    """خواندن JSON پاسخ مدل؛ یک fallback برای پاسخ‌های دارای code fence هم دارد."""
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    candidates = [text]
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start, end = text.find(opener), text.rfind(closer)
+        if start >= 0 and end > start:
+            candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("keywords", "hashtags", "terms"):
+                if isinstance(payload.get(key), list):
+                    return payload[key]
+    return []
+
+
+def generate_search_keywords(seed_terms, *, excluded_terms=(), max_keywords=5, model=None):
+    """
+    گسترش هشتگ‌های پایه با AvalAI برای پایش پوشاک کژوال مردانه.
+
+    این تابع «جست‌وجوی زنده» انجام نمی‌دهد؛ فقط عبارت‌های مناسب جست‌وجو
+    تولید می‌کند. هر عبارت تکراری، هشتگ پایه، یا عبارت موجود در سابقه حذف می‌شود.
+    خروجی: (فهرست عبارت‌های تازه، خطا یا None).
+    """
+    seeds = _unique_search_keywords(seed_terms, limit=100)
+    excluded = list(seeds) + list(excluded_terms or [])
+    if max_keywords <= 0:
+        return [], None
+    if not config.AVALAI_API_KEY:
+        return [], "AVALAI_API_KEY تنظیم نشده؛ از هشتگ‌های ثبت‌شده‌ی اسکژول استفاده می‌شود."
+
+    system_prompt = (
+        "تو دستیار گسترش عبارت جست‌وجو برای رصد بازار پوشاک کژوال مردانه هستی. "
+        "ادعای ترند بودن یا اطلاعات زنده نساز؛ فقط عبارت‌های قابل جست‌وجو پیشنهاد بده. "
+        "تمرکز روی ایران و ترکیه و پیراهن کژوال مردانه، شلوار کژوال، تی‌شرت و آیتم‌های "
+        "قابل تولید برای یک برند کژوال مردانه است. لباس زنانه، رسمی/مجلسی و ورزشی تخصصی را حذف کن. "
+        "عبارت‌ها می‌توانند فارسی، ترکی یا انگلیسی باشند. خروجی فقط JSON با ساختار "
+        '{"keywords": ["...", "..."]} باشد.'
+    )
+    user_prompt = (
+        f"هشتگ‌های پایه: {json.dumps(seeds, ensure_ascii=False)}\n"
+        f"عبارت‌های استفاده‌شده که نباید تکرار شوند: "
+        f"{json.dumps([normalize_search_keyword(x) for x in (excluded_terms or [])][-100:], ensure_ascii=False)}\n"
+        f"دقیقاً حداکثر {int(max_keywords)} عبارت تازه و غیرتکراری تولید کن. "
+        "هر مورد باید برای جست‌وجوی هشتگ مناسب باشد؛ پیشوند # نگذار و توضیح اضافه نده."
+    )
+    try:
+        response = get_client().chat.completions.create(
+            model=model or config.AVALAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.35,
+            max_tokens=400,
+            timeout=30.0,
+        )
+        content = response.choices[0].message.content or ""
+        keywords = _parse_keyword_response(content)
+        return _unique_search_keywords(keywords, excluded=excluded, limit=max_keywords), None
+    except Exception as e:
+        return [], str(e)[:300]
 
 
 def get_client():

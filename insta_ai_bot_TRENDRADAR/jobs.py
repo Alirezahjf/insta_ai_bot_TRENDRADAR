@@ -1,5 +1,6 @@
 """موتور اجراها: نمایش نتایج + پایپ‌لاین اسکرپ فوری + جاب اسکژول‌شده + حلقه اسکژولر"""
 import csv
+import html
 import io
 import json
 import threading
@@ -12,6 +13,7 @@ import ai_service
 import apify_service
 import database
 import scoring
+import search_service
 from core import bot, fmt_num, main_menu, reset_user, send_long, tehran_now, to_hashtag_urls
 
 TYPE_NAMES = {"posts": "📷 پست", "reels": "🎬 ریلز", "both": "📷+🎬 پست و ریلز"}
@@ -175,6 +177,31 @@ def fa_age(age_hours):
     return f"{int(h // 24)} روز پیش"
 
 
+def send_telegram_summary(chat_id, report=None, error=""):
+    """نمایش فشرده‌ی نتیجه‌ی جست‌وجوی Telegram؛ هر خطای نمایش ایزوله می‌ماند."""
+    lines = ["📡 <b>نتیجه جست‌وجوی Telegram</b>"]
+    if report is None:
+        lines.append(f"⚠️ اجرا نشد: <code>{html.escape(error or 'خطای نامشخص')}</code>")
+    else:
+        if report.signals:
+            lines.append(f"📈 {len(report.signals)} سیگنال از {report.posts_collected} پست جمع‌آوری‌شده:")
+            for signal in report.signals[:5]:
+                lines.append(
+                    f"• <b>#{html.escape(signal.tag)}</b> — امتیاز {signal.score:.1f}/100"
+                )
+                if signal.reason:
+                    lines.append(f"  {html.escape(signal.reason[:220])}")
+        else:
+            lines.append(f"ℹ️ سیگنال قابل‌رتبه‌بندی پیدا نشد ({report.posts_collected} پست بررسی شد).")
+        if report.errors:
+            short_errors = "; ".join(str(item)[:120] for item in report.errors[:2])
+            lines.append(f"⚠️ خطای جزئی: <code>{html.escape(short_errors)}</code>")
+    try:
+        bot.send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
+    except Exception as exc:
+        print(f"TELEGRAM SUMMARY ERROR: {exc}")
+
+
 # ============================================================
 # ⚡ پایپ‌لاین اسکرپ فوری
 # ============================================================
@@ -248,28 +275,84 @@ def run_scheduled_job(schedule_id):
     if not sched or sched["trashed"]:
         return
     chat_id = sched["chat_id"]
-    hashtags = sched["hashtags"] or []
+    hashtags = []
+    for raw_tag in sched["hashtags"] or []:
+        tag = ai_service.normalize_search_keyword(raw_tag)
+        if tag and tag not in hashtags:
+            hashtags.append(tag)
     count = sched["count_per_hashtag"]
     ctype = sched["content_type"]
     want_cm = bool(sched["want_comments"])
     top_n = sched["top_n"]
     cpc = sched["comments_per"]
-    tag_list = "، ".join(f"#{t}" for t in hashtags)
+    search_terms = list(hashtags)
+    generated_terms = []
+    keyword_error = ""
+    telegram_report = None
+    telegram_error = ""
+    apify_errors = []
     hm = tehran_now().strftime("%H:%M")
 
     try:
         status_msg = bot.send_message(chat_id,
-            f"⏰ <b>اجرای خودکار اسکژول #{schedule_id}</b>\n🕐 {hm} به وقت تهران\n🏷️ {tag_list}\n\n⏳ در حال اسکرپ...")
-        urls = to_hashtag_urls(hashtags)
+            f"⏰ <b>اجرای خودکار اسکژول #{schedule_id}</b>\n🕐 {hm} به وقت تهران\n"
+            f"🏷️ هشتگ‌های پایه: {'، '.join('#' + t for t in hashtags)}\n\n"
+            "🤖 در حال پیشنهاد کلیدواژه‌های تازه با AvalAI...")
+        try:
+            search_terms, generated_terms, keyword_error = search_service.generate_schedule_search_terms(
+                schedule_id, hashtags, max_keywords=5
+            )
+        except Exception as exc:
+            # خرابی سرویس AI/تاریخچه نباید مسیر اصلی Instagram را متوقف کند.
+            search_terms = list(hashtags)
+            keyword_error = f"{type(exc).__name__}: {exc}"[:300]
+        search_terms = search_terms or list(hashtags)
+        tag_list = "، ".join(f"#{t}" for t in search_terms)
+        generated_list = "، ".join(f"#{t}" for t in generated_terms) or "بدون پیشنهاد تازه"
+        bot.edit_message_text(
+            f"⏰ <b>اجرای خودکار اسکژول #{schedule_id}</b>\n🕐 {hm} به وقت تهران\n"
+            f"🏷️ عبارت‌های مشترک برای Instagram و Telegram: {tag_list}\n"
+            f"🤖 پیشنهاد تازه: {generated_list}\n\n⏳ در حال اسکرپ Instagram با Apify...",
+            chat_id, status_msg.message_id)
+
+        urls = to_hashtag_urls(search_terms)
         all_media = []
         if ctype in ("posts", "both"):
-            all_media.extend(apify_service.scrape_media(urls, "posts", count))
+            try:
+                all_media.extend(apify_service.scrape_media(urls, "posts", count))
+            except Exception as exc:
+                apify_errors.append(f"posts: {type(exc).__name__}: {exc}"[:180])
         if ctype in ("reels", "both"):
-            all_media.extend(apify_service.scrape_media(urls, "reels", count))
+            try:
+                all_media.extend(apify_service.scrape_media(urls, "reels", count))
+            except Exception as exc:
+                apify_errors.append(f"reels: {type(exc).__name__}: {exc}"[:180])
+
+        # Telegram مستقل از نتیجه‌ی Apify است؛ خطای هر مسیر نباید مسیر دیگر را قطع کند.
+        bot.edit_message_text(
+            f"⏰ اسکژول #{schedule_id}\n📡 در حال جست‌وجوی Telegram با همان عبارت‌ها...\n🏷️ {tag_list}",
+            chat_id, status_msg.message_id)
+        telegram_report, telegram_error = search_service.scan_telegram_terms(search_terms)
+
         if not all_media:
-            bot.edit_message_text(f"⏰ اسکژول #{schedule_id} اجرا شد ولی چیزی پیدا نشد 😕\n🏷️ {tag_list}",
-                                  chat_id, status_msg.message_id)
-            database.log_run(schedule_id, "EMPTY", 0)
+            bot.edit_message_text(
+                f"⏰ اسکژول #{schedule_id}: از Instagram چیزی پیدا نشد.\n🏷️ {tag_list}\n"
+                "گزارش Telegram جداگانه ارسال می‌شود.",
+                chat_id, status_msg.message_id)
+            send_telegram_summary(chat_id, telegram_report, telegram_error)
+            warnings = []
+            if keyword_error:
+                warnings.append(f"⚠️ پیشنهاد AvalAI در دسترس نبود؛ از هشتگ‌های پایه استفاده شد: {keyword_error[:180]}")
+            warnings.extend(f"⚠️ خطای Apify ({item})" for item in apify_errors[:2])
+            if warnings:
+                bot.send_message(chat_id, "\n".join(html.escape(warning) for warning in warnings))
+            run_status = "TELEGRAM_ONLY" if telegram_report is not None else "EMPTY"
+            run_error = "; ".join(apify_errors + ([telegram_error] if telegram_error else []))
+            database.log_run(
+                schedule_id, run_status,
+                getattr(telegram_report, "posts_collected", 0), "", run_error,
+                search_terms=search_terms,
+            )
             return
 
         # ۱) وایرال‌اسکور
@@ -345,7 +428,7 @@ def run_scheduled_job(schedule_id):
                 "comments_total": len(cmts),
             })
         verdict, err = ai_service.analyze_top_posts(candidates, {
-            "hashtags": hashtags, "scanned_count": len(all_media),
+            "hashtags": search_terms, "scanned_count": len(all_media),
             "date_str": tehran_now().strftime("%Y-%m-%d %H:%M"),
         })
         if verdict:
@@ -363,7 +446,10 @@ def run_scheduled_job(schedule_id):
                         reply_markup=kb)
             except Exception:
                 pass
-            database.log_run(schedule_id, "OK", len(all_media), top3[0].get("url", ""))
+            database.log_run(
+                schedule_id, "OK", len(all_media), top3[0].get("url", ""),
+                search_terms=search_terms,
+            )
         else:
             bot.edit_message_text(
                 f"⚠️ تحلیل AI ناموفق بود: <code>{err}</code>\n\n"
@@ -371,8 +457,18 @@ def run_scheduled_job(schedule_id):
                     f"{i + 1}. 🔥 {p.get('viral_score')} — @{p.get('ownerUsername', '?')} — {p.get('url', '')}"
                     for i, p in enumerate(top3)),
                 chat_id, ai_msg.message_id)
-            database.log_run(schedule_id, "AI_FAIL", len(all_media), top3[0].get("url", ""), err or "")
+            database.log_run(
+                schedule_id, "AI_FAIL", len(all_media), top3[0].get("url", ""), err or "",
+                search_terms=search_terms,
+            )
 
+        send_telegram_summary(chat_id, telegram_report, telegram_error)
+        warnings = []
+        if keyword_error:
+            warnings.append(f"⚠️ پیشنهاد AvalAI ناموفق بود؛ هشتگ‌های پایه استفاده شدند: {keyword_error[:180]}")
+        warnings.extend(f"⚠️ خطای Apify ({item})" for item in apify_errors[:2])
+        if warnings:
+            bot.send_message(chat_id, "\n".join(html.escape(warning) for warning in warnings))
         bot.send_message(chat_id, "🎉 گزارش اسکژول کامل شد! 👇", reply_markup=main_menu())
     except Exception as e:
         print(f"SCHEDULED JOB ERROR #{schedule_id}: {e}")
@@ -380,7 +476,9 @@ def run_scheduled_job(schedule_id):
             bot.send_message(chat_id, f"❌ <b>خطا در اجرای اسکژول #{schedule_id}!</b>\n<code>{str(e)[:400]}</code>")
         except Exception:
             pass
-        database.log_run(schedule_id, "FAILED", 0, "", str(e)[:300])
+        database.log_run(
+            schedule_id, "FAILED", 0, "", str(e)[:300], search_terms=search_terms
+        )
 
 
 # ============================================================
