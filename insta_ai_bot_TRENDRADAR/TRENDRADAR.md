@@ -228,9 +228,8 @@ TREND_W_REACH=0.22
 
 | عملیات | متد واقعی | محل استفاده |
 |---|---|---|
-| **جستجوی هشتگ در چنل** ⭐ | `channels.SearchPostsRequest(offset_rate, offset_peer, offset_id, limit, hashtag=...)` | `search.py` |
-| جستجوی سراسری | `messages.SearchGlobalRequest(q, filter, min_date, offset_rate, offset_peer, offset_id, limit, ...)` | `search.py` |
-| جستجو در تاریخ چت | `messages.SearchRequest` (از طریق `client.iter_messages(search=...)`) | `search.py` |
+| **جستجوی هشتگ در اسکژول** ⭐ | `messages.SearchGlobalRequest(q="#<tag>", ...)`؛ مستقل از کشف کانال | `search.py` |
+| تکمیل نتایج کم | `client.iter_messages(search=<tag>)` در کانال‌های عضو؛ بدون auto-join | `search.py` |
 | کشف کانال | `contacts.SearchRequest(q, limit, broadcasts=None)` | `discovery.py` |
 | کانال‌های مشابه | `channels.GetChannelRecommendationsRequest(channel)` | `discovery.py` |
 | آمار کانال | `channels.GetFullChannelRequest(channel)` → `ChannelFull` | `discovery.py` |
@@ -239,28 +238,16 @@ TREND_W_REACH=0.22
 | ترک | `channels.LeaveChannelRequest(channel)` | `membership.py` |
 | احراز هویت | `send_code_request` / `sign_in` / `sign_in(password=)` | `client.py` |
 
-### نکته‌ی کلیدی درباره‌ی `SearchPostsRequest`
+### راهبرد جست‌وجو در اجرای اسکژول
 
-این متد **دو پارامتر متفاوت** دارد که نباید اشتباه شوند:
+کلیدواژه‌ی تولیدشده‌ی AvalAI به یک هشتگ جست‌وجو تبدیل می‌شود و همان عبارت
+ابتدا با `messages.SearchGlobalRequest(q="#<tag>", ...)` در Telegram جست‌وجو
+می‌شود؛ بنابراین جست‌وجو به پیدا شدن کانال یا عضویت در آن وابسته نیست. اگر
+نتیجه کم باشد، تاریخ کانال‌های ازقبل‌عضوشده می‌تواند تکمیل‌کننده باشد.
 
-```python
-# ✅ درست — هشتگ بدون علامت #، جستجو در ایندکس هشتگ تلگرام (دقیق‌تر)
-SearchPostsRequest(..., hashtag="ترند_مدلینگ", query=None)
-
-# ❌ اشتباه — با # کار نمی‌کند
-SearchPostsRequest(..., hashtag="#ترند_مدلینگ")
-```
-
-صفحه‌بندی با فیلد `next_rate` از خروجی `messages.MessagesSlice` انجام می‌شود:
-
-```python
-result = await client(SearchPostsRequest(offset_rate=0, offset_id=0,
-                                          offset_peer=InputPeerEmpty(), limit=100,
-                                          hashtag=tag))
-# صفحه‌ی بعد:
-result = await client(SearchPostsRequest(offset_rate=result.next_rate,
-                                          offset_id=result.messages[-1].id, ...))
-```
+مسیر Telegram از همان فهرست هشتگ‌هایی استفاده می‌کند که Apify برای Instagram
+می‌گیرد. سقف جست‌وجوی روزانه و rate limit روی درخواست‌ها اعمال می‌شوند و
+اسکن اسکژول هیچ‌وقت کانالی را خودکار join نمی‌کند.
 
 ### خطاهایی که مدیریت می‌شوند
 
