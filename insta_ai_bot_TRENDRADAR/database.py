@@ -37,7 +37,19 @@ def init(path):
           status TEXT DEFAULT '',
           items_count INTEGER DEFAULT 0,
           winner_url TEXT DEFAULT '',
-          error TEXT DEFAULT ''
+          error TEXT DEFAULT '',
+          search_terms TEXT NOT NULL DEFAULT '[]'
+        )""")
+        columns = {row[1] for row in con.execute("PRAGMA table_info(job_runs)")}
+        if "search_terms" not in columns:
+            con.execute("ALTER TABLE job_runs ADD COLUMN search_terms TEXT NOT NULL DEFAULT '[]'")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS schedule_keyword_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          schedule_id INTEGER NOT NULL,
+          term TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(schedule_id, term)
         )""")
 
 
@@ -127,12 +139,44 @@ def restore_schedule(sid: int):
 
 def purge_schedule(sid: int):
     with _lock, sqlite3.connect(_db_path) as con:
+        con.execute("DELETE FROM schedule_keyword_history WHERE schedule_id=?", (sid,))
         con.execute("DELETE FROM schedules WHERE id=?", (sid,))
 
 
 def purge_all_trash(chat_id):
     with _lock, sqlite3.connect(_db_path) as con:
+        con.execute("""DELETE FROM schedule_keyword_history
+            WHERE schedule_id IN (
+              SELECT id FROM schedules WHERE chat_id=? AND trashed=1
+            )""", (chat_id,))
         con.execute("DELETE FROM schedules WHERE chat_id=? AND trashed=1", (chat_id,))
+
+
+def get_schedule_keyword_history(sid: int):
+    """تمام عبارت‌های تولیدشده‌ی قبلی یک اسکژول را برای جلوگیری از تکرار برمی‌گرداند."""
+    with _lock, sqlite3.connect(_db_path) as con:
+        rows = con.execute(
+            "SELECT term FROM schedule_keyword_history WHERE schedule_id=? ORDER BY id",
+            (sid,),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def record_schedule_keywords(sid: int, terms):
+    """کلیدواژه‌های جدید را اتمیک ثبت می‌کند و فقط مواردی را برمی‌گرداند که تازه بودند."""
+    now = datetime.now().isoformat(timespec="seconds")
+    inserted = []
+    with _lock, sqlite3.connect(_db_path) as con:
+        for term in terms or []:
+            if not isinstance(term, str) or not term.strip():
+                continue
+            cur = con.execute(
+                "INSERT OR IGNORE INTO schedule_keyword_history (schedule_id, term, created_at) VALUES (?,?,?)",
+                (sid, term.strip(), now),
+            )
+            if cur.rowcount:
+                inserted.append(term.strip())
+    return inserted
 
 
 def mark_triggered(sid: int, key: str):
@@ -140,10 +184,11 @@ def mark_triggered(sid: int, key: str):
         con.execute("UPDATE schedules SET last_triggered=? WHERE id=?", (key, sid))
 
 
-def log_run(schedule_id, status, items_count=0, winner_url="", error=""):
+def log_run(schedule_id, status, items_count=0, winner_url="", error="", search_terms=None):
     with _lock, sqlite3.connect(_db_path) as con:
         con.execute("""INSERT INTO job_runs
-            (schedule_id, triggered_at, status, items_count, winner_url, error)
-            VALUES (?,?,?,?,?,?)""", (
+            (schedule_id, triggered_at, status, items_count, winner_url, error, search_terms)
+            VALUES (?,?,?,?,?,?,?)""", (
             schedule_id, datetime.now().isoformat(timespec="seconds"),
-            status, items_count, winner_url, error[:500]))
+            status, items_count, winner_url, error[:500],
+            json.dumps(search_terms or [], ensure_ascii=False)))

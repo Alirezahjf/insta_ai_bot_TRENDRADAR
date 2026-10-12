@@ -2,26 +2,19 @@
 🔎 جستجوی هشتگ در تلگرام
 ========================
 
-سه استراتژی جستجو، هر کدام با متد واقعی Telethon 1.45.0:
+دو مسیر جستجو، هر کدام با متد واقعی Telethon:
 
 ┌──────────────────────┬────────────────────────────────┬─────────────────────┐
 │ استراتژی             │ متد                            │ کاربرد              │
 ├──────────────────────┼────────────────────────────────┼─────────────────────┤
-│ جستجوی سراسری        │ messages.SearchGlobalRequest   │ کشف اولیه، بی‌نیاز  │
-│                      │                                │ از عضو بودن         │
-│ جستجوی هشتگ در چنل   │ channels.SearchPostsRequest    │ هدفمند، دقیق‌ترین   │
-│ جستجو در تاریخ چنل   │ messages.SearchRequest /       │ چنل‌هایی که پست‌های  │
-│                      │ client.iter_messages(search=)  │ آن‌ها ایندکس نشده   │
+│ جستجوی سراسری        │ messages.SearchGlobalRequest   │ بی‌نیاز از کشف/عضویت│
+│ جستجوی تاریخ چنل     │ client.iter_messages(search=)  │ تکمیل نتایج چنل‌های │
+│                      │                                │ عضو                 │
 └──────────────────────┴────────────────────────────────┴─────────────────────┘
 
-نکته‌ی مهم درباره‌ی `SearchPostsRequest`
----------------------------------------
-این متد دو پارامتر متفاوت دارد که نباید اشتباه شوند:
-  • `hashtag` → فقط هشتگ (بدون علامت #). خیلی دقیق‌تر عمل می‌کند.
-  • `query`   → جستجوی متنی آزاد.
-
-خروجی `messages.MessagesSlice` است که فیلد `next_rate` برای صفحه‌بندی
-بعدی لازم است.
+جستجوی هشتگ در اسکژول ابتدا سراسری است؛ جستجوی تاریخ کانال‌های عضو فقط
+وقتی نتیجه کم باشد به‌عنوان مسیر تکمیلی استفاده می‌شود. هیچ عضویتی خودکار
+انجام نمی‌شود.
 """
 from __future__ import annotations
 
@@ -30,7 +23,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Sequence
 
-from ...errors import ProviderError, RateLimited
+from ...errors import DailyCapReached, RateLimited
 from ...models import ChannelRef, Post, normalize_hashtag
 from .mapper import messages_to_posts
 
@@ -60,8 +53,8 @@ class TelegramSearch:
         self.tg = tg_client
 
     # ═════════════════════════════════════════════════════════
-    # ۱) جستجوی هشتگ **داخل کانال‌های مشخص**
-    #    متد واقعی: channels.SearchPostsRequest  [id=0xf2c4f24d]
+    # ۱) جستجوی هشتگ دقیق داخل کانال‌های مشخص
+    #    متد واقعی: client.iter_messages(search=...)
     # ═════════════════════════════════════════════════════════
     async def search_hashtag_in_channel(
         self,
@@ -72,74 +65,16 @@ class TelegramSearch:
         since: Optional[datetime] = None,
         max_pages: int = _MAX_PAGES,
     ) -> List[Post]:
-        """
-        جستجوی یک هشتگ داخل یک کانال.
-
-        این دقیق‌ترین روش است، چون:
-          • فقط پست‌های همان کانال را می‌دهد
-          • هشتگ را در ایندکس هشتگ تلگرام می‌گردد (نه جستجوی متنی)
-
-        پیاده‌سازی با صفحه‌بندی روی `next_rate`:
-
-            SearchPostsRequest(
-                offset_rate=0,
-                offset_peer=InputPeerEmpty(),
-                offset_id=0,
-                limit=100,
-                hashtag="ترند",          ← بدون #
-            )
-            → MessagesSlice(next_rate=..., messages=[...], chats=[...])
-
-        صفحه‌ی بعد:
-            SearchPostsRequest(offset_rate=<next_rate>, offset_id=<آخرین id>, ...)
-        """
-        functions, types = _import()
+        """جست‌وجوی یک هشتگ دقیقاً در تاریخ همان چت/کانال."""
         tag = normalize_hashtag(tag)
         if not tag or limit <= 0:
             return []
-
-        collected: List[Post] = []
-        offset_rate = 0
-        offset_id = 0
-        peer = types.InputPeerEmpty()
-
-        try:
-            input_channel = await self.tg.raw.get_input_entity(channel.native_id)
-        except Exception as e:
-            log.debug("get_input_entity ناموفق (%s): %s", channel.uid, e)
-            return []
-
-        for page in range(max_pages):
-            try:
-                result = await self.tg.request(
-                    functions.channels.SearchPostsRequest(
-                        offset_rate=offset_rate,
-                        offset_peer=peer,
-                        offset_id=offset_id,
-                        limit=min(100, max(10, limit - len(collected))),
-                        hashtag=tag,
-                    )
-                )
-            except RateLimited:
-                raise
-            except Exception as e:
-                log.debug("جستجوی هشتگ #%s در %s ناموفق: %s", tag, channel.title, e)
-                break
-
-            msgs = getattr(result, "messages", None) or []
-            posts = messages_to_posts(msgs, channel=channel)
-            collected.extend(self._filter_window(posts, since))
-
-            next_rate = getattr(result, "next_rate", None)
-            if not next_rate or not msgs or len(collected) >= limit:
-                break
-
-            offset_rate = next_rate
-            offset_id = getattr(msgs[-1], "id", 0) or 0
-            await asyncio.sleep(0.4)      # فاصله‌ی کوچک بین صفحه‌ها
-
-        log.debug("  #%s در «%s» → %d پست", tag, channel.title, len(collected))
-        return collected[:limit]
+        posts = await self.search_in_chat_history(
+            channel, tag, limit=limit, since=since
+        )
+        exact = [post for post in posts if tag in post.hashtags]
+        log.debug("  #%s در «%s» → %d پست", tag, channel.title, len(exact))
+        return exact[:limit]
 
     async def search_hashtag_in_channels(
         self,
@@ -151,32 +86,25 @@ class TelegramSearch:
         concurrency: int = 3,
     ) -> List[Post]:
         """
-        جستجوی یک هشتگ در چند کانال به‌صورت موازی (با سقف هم‌زمانی).
-
-        هم‌زمانی محدود نگه داشته می‌شود چون درخواست‌های موازی زیاد
-        = ریسک FloodWait و بن.
+        جستجوی یک هشتگ در چند کانال به‌صورت ترتیبی تا گارد نرخ و سقف روزانه
+        رعایت شوند. آرگومان concurrency برای سازگاری API حفظ شده است.
         """
-        if not channels:
+        if not channels or limit <= 0:
             return []
 
-        per = max(5, limit // len(channels) + 1)
-        sem = asyncio.Semaphore(max(1, concurrency))
+        per = max(1, limit // len(channels) + 1)
         out: List[Post] = []
-
-        async def _one(ch: ChannelRef) -> List[Post]:
-            async with sem:
-                try:
-                    return await self.search_hashtag_in_channel(ch, tag, limit=per, since=since)
-                except RateLimited:
-                    raise
-                except Exception as e:
-                    log.debug("خطا در جستجوی %s: %s", ch.uid, e)
-                    return []
-
-        results = await asyncio.gather(*(_one(c) for c in channels), return_exceptions=True)
-        for r in results:
-            if isinstance(r, list):
-                out.extend(r)
+        for channel in channels:
+            try:
+                out.extend(await self.search_hashtag_in_channel(
+                    channel, tag, limit=per, since=since
+                ))
+            except (RateLimited, DailyCapReached):
+                raise
+            except Exception as exc:
+                log.debug("خطا در جستجوی %s: %s", channel.uid, exc)
+            if len(out) >= limit:
+                break
         return self._dedupe(out)[:limit]
 
     # ═════════════════════════════════════════════════════════
@@ -231,7 +159,7 @@ class TelegramSearch:
                     req_kwargs["broadcasts_only"] = True
 
                 result = await self.tg.request(functions.messages.SearchGlobalRequest(**req_kwargs))
-            except RateLimited:
+            except (RateLimited, DailyCapReached):
                 raise
             except Exception as e:
                 log.debug("جستجوی سراسری «%s» ناموفق: %s", term, e)
@@ -242,6 +170,8 @@ class TelegramSearch:
             chat_index = self._chat_index(getattr(result, "chats", None) or [])
             for m in msgs:
                 ch = self._channel_of_message(m, chat_index)
+                if ch is None:
+                    continue
                 p = messages_to_posts([m], channel=ch)[:1]
                 if p:
                     collected.extend(self._filter_window(p, since))
@@ -279,6 +209,10 @@ class TelegramSearch:
             return []
 
         out: List[Post] = []
+        if self.tg.search_counter is not None:
+            self.tg.search_counter.check("جستجو در تلگرام")
+            self.tg.search_counter.bump()
+        await self.tg.search_limiter.wait_async()
         try:
             entity = await self.tg.raw.get_input_entity(channel.native_id)
         except Exception as e:
@@ -289,20 +223,12 @@ class TelegramSearch:
             async for m in self.tg.raw.iter_messages(
                 entity, limit=limit, search=term, offset_date=since, reverse=False
             ):
-                if (self.tg.search_counter is not None):
-                    # iter_messages خودش صفحه‌بندی می‌کند؛ این‌جا فقط سقف را چک می‌کنیم
-                    try:
-                        self.tg.search_counter.check("جستجو در تلگرام")
-                    except Exception as e:
-                        log.warning("سقف روزانه‌ی جستجو پر شد: %s", e)
-                        break
-
                 batch = messages_to_posts([m], channel=channel)
                 out.extend(self._filter_window(batch, since))
                 if len(out) >= limit:
                     break
                 await asyncio.sleep(0.15)     # نرم‌کردن نرخ درخواست
-        except RateLimited:
+        except (RateLimited, DailyCapReached):
             raise
         except Exception as e:
             log.debug("جستجو در تاریخ %s ناموفق: %s", channel.title, e)
