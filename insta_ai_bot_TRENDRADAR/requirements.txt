@@ -1,0 +1,7 @@
+pyTelegramBotAPI>=4.12
+apify-client>=1.9
+openai>=1.0
+python-dotenv>=1.0
+tzdata>=1.0
+telethon>=1.36
+PySocks>=1.7

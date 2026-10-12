@@ -1,0 +1,34 @@
+[Unit]
+Description=Insta AI Bot (Telegram + Apify + AvalAI)
+# ⚠️ اگه ربات سریع‌سریع کرش می‌کنه، systemd بعد از ۵ بار بی‌خیالش می‌شه — این خط جلوش رو می‌گیره
+StartLimitIntervalSec=0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+
+# ⬇️⬇️⬇️ این دو مسیر رو با مسیر واقعی پروژه‌ت تنظیم کن ⬇️⬇️⬇️
+WorkingDirectory=/root/Desktop/insta_ai_bot
+ExecStart=/root/Desktop/insta_ai_bot/venv/bin/python /root/Desktop/insta_ai_bot/bot.py
+
+# 🔁 مهم‌ترین خط: هر دلیلی که پروسه مرد (Terminated / Killed / کرش / قطع SSH / ریبوت سرویس)
+#    systemd ده ثانیه بعد دوباره بالا می‌آرودش. دیگه دستی restart لازم نیست.
+Restart=always
+RestartSec=10
+
+# لاگ بدون بافر + یونیکد سالم برای متن فارسی
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=LANG=C.UTF-8
+
+# ست کردن مهلت برای خاموش شدن تمیز
+TimeoutStopSec=20
+KillMode=mixed
+
+# ℹ️ نکته: چون پروسه زیر systemd اجرا می‌شه، اصلاً بچه‌ی ترمینال نیست
+#    → قطع شدن SSH یا بستن ترمینال هیچ تاثیری روی ربات نداره
+
+[Install]
+WantedBy=multi-user.target
