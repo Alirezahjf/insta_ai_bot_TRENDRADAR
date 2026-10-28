@@ -5,3 +5,4 @@ python-dotenv>=1.0
 tzdata>=1.0
 telethon>=1.36
 PySocks>=1.7
+pinscrape>=5.2.0

@@ -13,3 +13,6 @@ bot.log
 
 # Generated TrendRadar reports
 trend_report_*.json
+
+# pinscrape local runtime state
+data/time_epoch.json

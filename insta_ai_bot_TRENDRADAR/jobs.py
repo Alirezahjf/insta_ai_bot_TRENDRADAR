@@ -14,6 +14,8 @@ import apify_service
 import database
 import scoring
 import search_service
+import pinterest_service
+import unified_ranking
 from core import bot, fmt_num, main_menu, reset_user, send_long, tehran_now, to_hashtag_urls
 
 TYPE_NAMES = {"posts": "📷 پست", "reels": "🎬 ریلز", "both": "📷+🎬 پست و ریلز"}
@@ -202,6 +204,32 @@ def send_telegram_summary(chat_id, report=None, error=""):
         print(f"TELEGRAM SUMMARY ERROR: {exc}")
 
 
+def send_unified_results(chat_id, instagram, telegram_report, pinterest, pinterest_errors):
+    """Show an explicitly relative shortlist and attach all candidates as JSON."""
+    try:
+        ranking = unified_ranking.build_unified_ranking(instagram, telegram_report, pinterest)
+        lines = ["🏆 <b>رتبه‌بندی مشترک سه پلتفرم</b>",
+                 "امتیاز نسبی بر اساس رتبه داخل هر پلتفرم است؛ مقایسه قطعی ترند یا تعامل واقعی نیست.",
+                 "Telegram فقط پست‌های برتر سیگنال‌های قابل‌تحلیل را شامل می‌شود."]
+        for i, item in enumerate(ranking[:12], 1):
+            title = html.escape(item["title"].replace("\n", " ")[:100])
+            url = item["url"]
+            link = f' — <a href="{html.escape(url, quote=True)}">مشاهده</a>' if url.startswith(("https://", "http://")) else ""
+            lines.append(f'{i}. <b>{item["platform"]}</b> | {item["relative_score"]:.0f}/100 | {title}{link}')
+        if not ranking:
+            lines.append("نتیجه قابل رتبه‌بندی پیدا نشد.")
+        if pinterest_errors:
+            lines.append("⚠️ Pinterest: " + html.escape("؛ ".join(pinterest_errors[:3])[:500]))
+        bot.send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
+        if ranking:
+            data = io.BytesIO(json.dumps({"ranking": ranking, "pinterest": pinterest,
+                                         "pinterest_errors": pinterest_errors}, ensure_ascii=False, indent=2).encode("utf-8"))
+            data.name = "unified_trends.json"
+            bot.send_document(chat_id, data, caption="📦 رتبه‌بندی مشترک و جزئیات پینترست")
+    except Exception as exc:
+        print(f"UNIFIED REPORT ERROR: {exc}")
+
+
 # ============================================================
 # ⚡ پایپ‌لاین اسکرپ فوری
 # ============================================================
@@ -311,7 +339,7 @@ def run_scheduled_job(schedule_id):
         generated_list = "، ".join(f"#{t}" for t in generated_terms) or "بدون پیشنهاد تازه"
         bot.edit_message_text(
             f"⏰ <b>اجرای خودکار اسکژول #{schedule_id}</b>\n🕐 {hm} به وقت تهران\n"
-            f"🏷️ عبارت‌های مشترک برای Instagram و Telegram: {tag_list}\n"
+            f"🏷️ عبارت‌های مشترک برای Instagram، Telegram و Pinterest: {tag_list}\n"
             f"🤖 پیشنهاد تازه: {generated_list}\n\n⏳ در حال اسکرپ Instagram با Apify...",
             chat_id, status_msg.message_id)
 
@@ -333,6 +361,16 @@ def run_scheduled_job(schedule_id):
             f"⏰ اسکژول #{schedule_id}\n📡 در حال جست‌وجوی Telegram با همان عبارت‌ها...\n🏷️ {tag_list}",
             chat_id, status_msg.message_id)
         telegram_report, telegram_error = search_service.scan_telegram_terms(search_terms)
+        bot.edit_message_text(
+            f"⏰ اسکژول #{schedule_id}\n📌 در حال جست‌وجوی Pinterest...",
+            chat_id, status_msg.message_id)
+        try:
+            pinterest_pins, pinterest_errors = pinterest_service.scan_pinterest_terms(search_terms)
+        except Exception as exc:
+            pinterest_pins, pinterest_errors = [], [f"{type(exc).__name__}: {exc}"[:240]]
+        # Produce the shared shortlist even if Instagram or Telegram returned no results.
+        ranked = scoring.compute_virality(all_media) if all_media else []
+        send_unified_results(chat_id, ranked, telegram_report, pinterest_pins, pinterest_errors)
 
         if not all_media:
             bot.edit_message_text(
@@ -346,8 +384,8 @@ def run_scheduled_job(schedule_id):
             warnings.extend(f"⚠️ خطای Apify ({item})" for item in apify_errors[:2])
             if warnings:
                 bot.send_message(chat_id, "\n".join(html.escape(warning) for warning in warnings))
-            run_status = "TELEGRAM_ONLY" if telegram_report is not None else "EMPTY"
-            run_error = "; ".join(apify_errors + ([telegram_error] if telegram_error else []))
+            run_status = "PARTIAL" if pinterest_pins or telegram_report is not None else "EMPTY"
+            run_error = "; ".join(apify_errors + ([telegram_error] if telegram_error else []) + pinterest_errors)
             database.log_run(
                 schedule_id, run_status,
                 getattr(telegram_report, "posts_collected", 0), "", run_error,
@@ -358,7 +396,7 @@ def run_scheduled_job(schedule_id):
         # ۱) وایرال‌اسکور
         bot.edit_message_text(f"⏰ اسکژول #{schedule_id}\n📊 در حال محاسبه وایرال‌اسکور {len(all_media)} پست...",
                               chat_id, status_msg.message_id)
-        ranked = scoring.compute_virality(all_media)
+        # رتبه‌بندی پیش‌تر برای گزارش مشترک محاسبه شده است.
 
         # ۲) کامنت برای پست‌های برتر (بر اساس وایرال‌اسکور)
         comments, grouped, cm_error = [], {}, ""
@@ -448,7 +486,7 @@ def run_scheduled_job(schedule_id):
                 pass
             database.log_run(
                 schedule_id, "OK", len(all_media), top3[0].get("url", ""),
-                search_terms=search_terms,
+                error="; ".join(pinterest_errors)[:300], search_terms=search_terms,
             )
         else:
             bot.edit_message_text(
@@ -458,7 +496,7 @@ def run_scheduled_job(schedule_id):
                     for i, p in enumerate(top3)),
                 chat_id, ai_msg.message_id)
             database.log_run(
-                schedule_id, "AI_FAIL", len(all_media), top3[0].get("url", ""), err or "",
+                schedule_id, "AI_FAIL", len(all_media), top3[0].get("url", ""), "; ".join(filter(None, [err, *pinterest_errors]))[:300],
                 search_terms=search_terms,
             )
 

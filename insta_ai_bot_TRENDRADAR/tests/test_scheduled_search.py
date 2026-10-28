@@ -148,6 +148,9 @@ class ScheduledJobRoutingTests(unittest.TestCase):
             def edit_message_text(self, *_args, **_kwargs):
                 return None
 
+            def send_document(self, *_args, **_kwargs):
+                return None
+
         with patch.object(jobs, "bot", FakeBot()), patch.object(
             jobs.database, "get_schedule", return_value=schedule
         ), patch.object(jobs.database, "log_run") as log_run, patch.object(
@@ -155,7 +158,11 @@ class ScheduledJobRoutingTests(unittest.TestCase):
             return_value=(terms, ["fresh_term"], None),
         ), patch.object(jobs.apify_service, "scrape_media", side_effect=[[], []]) as scrape, patch.object(
             jobs.search_service, "scan_telegram_terms", return_value=(None, "Telegram unavailable")
-        ) as telegram_scan:
+        ) as telegram_scan, patch.object(
+            jobs.pinterest_service, "scan_pinterest_terms", return_value=([{
+                "pin_id": "1", "title": "shirt", "score": 75, "pin_url": "https://pinterest.com/pin/1/"
+            }], [])
+        ) as pinterest_scan:
             jobs.run_scheduled_job(7)
 
         urls = [
@@ -164,7 +171,9 @@ class ScheduledJobRoutingTests(unittest.TestCase):
         ]
         self.assertEqual(scrape.call_args_list, [call(urls, "posts", 10), call(urls, "reels", 10)])
         telegram_scan.assert_called_once_with(terms)
+        pinterest_scan.assert_called_once_with(terms)
         self.assertEqual(log_run.call_args.kwargs["search_terms"], terms)
+        self.assertEqual(log_run.call_args.args[1], "PARTIAL")
 
 
 class TelegramSearchIntegrationTests(unittest.TestCase):
