@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import threading
@@ -68,6 +69,14 @@ class RateLimiter:
         if delay > 0:
             log.debug("[%s] صبر %.1f ثانیه", self.name, delay)
             time.sleep(delay)
+        return delay
+
+    async def wait_async(self) -> float:
+        """نسخه‌ی غیرمسدودکننده برای مسیرهای async تلگرام."""
+        delay = self._delay_for()
+        if delay > 0:
+            log.debug("[%s] صبر async %.1f ثانیه", self.name, delay)
+            await asyncio.sleep(delay)
         return delay
 
     def block_for(self, seconds: float) -> None:

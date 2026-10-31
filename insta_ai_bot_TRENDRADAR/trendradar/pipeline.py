@@ -116,7 +116,11 @@ class TrendPipeline:
 
         # ── مرحله ۳: جمع‌آوری پست‌ها ──
         posts = await self._collect(query, channels, tags, since, report)
+        report.posts = posts
         report.posts_collected = len(posts)
+        warnings = getattr(self.provider, "drain_warnings", None)
+        if callable(warnings):
+            report.errors.extend(warnings())
         log.info("📥 پست‌های جمع‌آوری‌شده: %d", len(posts))
 
         if not posts:
@@ -377,8 +381,10 @@ class TrendPipeline:
                     seen.add(p.uid)
                     posts.append(p)
 
-        # ── الف) جستجوی هشتگ داخل کانال‌ها ──
-        if channels and self.provider.supports(Capability.SEARCH_IN_CHANNEL):
+        # ── الف) جستجوی هشتگ (سراسری و/یا داخل کانال‌ها) ──
+        # جستجوی Telegram نباید به کشف کانال متکی باشد؛ در اجرای بدون کانال،
+        # provider باید جستجوی سراسری را با همان هشتگ انجام دهد.
+        if self.provider.supports(Capability.SEARCH_HASHTAG):
             for tag in tags:
                 try:
                     found = await self.provider.search_hashtag(

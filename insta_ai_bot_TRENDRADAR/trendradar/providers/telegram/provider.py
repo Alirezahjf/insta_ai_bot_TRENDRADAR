@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
-from ...errors import AuthRequired, ConfigError, ProviderNotAvailable
+from ...errors import AuthRequired, ConfigError, ProviderNotAvailable, RateLimited, DailyCapReached
 from ...models import ChannelKind, ChannelRef, Post, ProviderHealth, utcnow
 from ..base import Capability, MessengerProvider
 from .client import TrendTelegramClient
@@ -65,11 +65,13 @@ class TelegramProvider(MessengerProvider):
         self.search_ops = TelegramSearch(self.tg)
         self.discovery_ops = TelegramDiscovery(self.tg)
         self.membership_ops = TelegramMembership(self.tg)
+        self._search_warnings = []
 
     # ═════════════════════════════════════════════════════════
     # چرخه‌ی عمر
     # ═════════════════════════════════════════════════════════
     async def connect(self) -> None:
+        self._search_warnings = []
         try:
             await self.tg.connect(require_auth=True)
             self._connected = True
@@ -179,21 +181,57 @@ class TelegramProvider(MessengerProvider):
         since: Optional[datetime] = None,
     ) -> List[Post]:
         """
-        جستجوی هشتگ.
+        جستجوی هشتگ به‌صورت سراسری؛ به کشف کانال یا عضویت وابسته نیست.
 
-        اگر `channels` داده شود → جستجوی دقیق داخل همان کانال‌ها
-        اگر خالی باشد          → جستجوی سراسری تلگرام
+        اگر نتیجه کم باشد، مرحله‌ی تکمیلی تاریخ کانال‌های عضو در pipeline اجرا
+        می‌شود تا یک جستجو در چند لایه دوباره‌کاری نشود.
         """
-        if channels:
-            posts = await self.search_ops.search_hashtag_in_channels(
-                tag, channels, limit=limit, since=since
-            )
-            if posts:
-                return posts
-            # اگر داخل کانال‌ها چیزی نبود، سراسری را هم امتحان کن
-            log.debug("نتیجه‌ای در کانال‌ها نبود (#%s) → جستجوی سراسری", tag)
+        try:
+            found = await self.search_ops.search_global(f"#{tag}", limit=limit, since=since)
+        except (RateLimited, DailyCapReached):
+            raise
+        except Exception as exc:
+            self._search_warnings.append(f"جستجوی #{tag}: {str(exc)[:120]}")
+            found = []
+        if found:
+            return found
 
-        return await self.search_ops.search_global(f"#{tag}", limit=limit, since=since)
+        # Fallback: discover public channels by words, then search their accessible
+        # history. Never join. A permission error is surfaced instead of faking zero.
+        query = tag.replace("_", " ")
+        try:
+            discovered = await self.discovery_ops.search_channels(query, limit=3, min_members=0)
+        except (RateLimited, DailyCapReached):
+            raise
+        except Exception as exc:
+            self._search_warnings.append(f"کشف کانال برای {tag}: {str(exc)[:120]}")
+            discovered = []
+        targets = []
+        for channel in list(discovered) + list(channels):
+            if channel.uid not in {c.uid for c in targets}:
+                targets.append(channel)
+        results = []
+        for channel in targets[:3]:
+            try:
+                # Text search handles both hashtagged and non-hashtagged content.
+                posts = await self.search_ops.search_in_chat_history(
+                    channel, query, limit=max(1, limit - len(results)), since=since)
+                for post in posts:
+                    # Record why a text result was matched, without pretending it
+                    # contained the exact hashtag in the original text.
+                    post.extra["matched_search_term"] = tag
+                results.extend(posts)
+            except (RateLimited, DailyCapReached):
+                raise
+            except Exception as exc:
+                self._search_warnings.append(f"کانال {channel.title or channel.uid}: {str(exc)[:120]}")
+            if len(results) >= limit:
+                break
+        return self.search_ops._dedupe(results)[:limit]
+
+    def drain_warnings(self):
+        warnings, self._search_warnings = self._search_warnings, []
+        return warnings
 
     async def search_keywords(
         self,
@@ -211,7 +249,7 @@ class TelegramProvider(MessengerProvider):
         for kw in keywords:
             if channels:
                 out.extend(
-                    await self.search_ops.search_hashtag_in_channels(
+                    await self.search_ops.search_in_channels_history(
                         kw, channels, limit=per, since=since
                     )
                 )
@@ -240,8 +278,10 @@ class TelegramProvider(MessengerProvider):
                         ch, term, limit=per, since=since
                     )
                 )
+            except (RateLimited, DailyCapReached):
+                raise
             except Exception as e:
-                log.debug("تاریخ %s ناموفق: %s", ch.uid, e)
+                self._search_warnings.append(f"تاریخ {ch.title or ch.uid}: {type(e).__name__}")
             if len(out) >= limit:
                 break
         return out[:limit]

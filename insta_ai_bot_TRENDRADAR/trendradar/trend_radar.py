@@ -223,6 +223,7 @@ class TrendRadar:
                 continue
 
             merged.signals.extend(rep.signals)
+            merged.posts.extend(rep.posts)
             merged.errors.extend(rep.errors)
             merged.channels_scanned += rep.channels_scanned
             merged.channels_discovered += rep.channels_discovered
