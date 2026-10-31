@@ -116,7 +116,11 @@ class TrendPipeline:
 
         # ── مرحله ۳: جمع‌آوری پست‌ها ──
         posts = await self._collect(query, channels, tags, since, report)
+        report.posts = posts
         report.posts_collected = len(posts)
+        warnings = getattr(self.provider, "drain_warnings", None)
+        if callable(warnings):
+            report.errors.extend(warnings())
         log.info("📥 پست‌های جمع‌آوری‌شده: %d", len(posts))
 
         if not posts:

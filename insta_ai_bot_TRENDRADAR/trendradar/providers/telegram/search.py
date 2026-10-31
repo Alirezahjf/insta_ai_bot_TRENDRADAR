@@ -23,7 +23,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Sequence
 
-from ...errors import DailyCapReached, RateLimited
+from ...errors import DailyCapReached, RateLimited, ProviderError
 from ...models import ChannelRef, Post, normalize_hashtag
 from .mapper import messages_to_posts
 
@@ -162,8 +162,7 @@ class TelegramSearch:
             except (RateLimited, DailyCapReached):
                 raise
             except Exception as e:
-                log.debug("جستجوی سراسری «%s» ناموفق: %s", term, e)
-                break
+                raise ProviderError(f"جستجوی سراسری تلگرام: {type(e).__name__}", provider="telegram") from e
 
             msgs = getattr(result, "messages", None) or []
             # کانال هر پیام را از chats نتیجه پیدا کن
@@ -216,12 +215,11 @@ class TelegramSearch:
         try:
             entity = await self.tg.raw.get_input_entity(channel.native_id)
         except Exception as e:
-            log.debug("get_input_entity ناموفق: %s", e)
-            return []
+            raise ProviderError(f"کانال تلگرام در دسترس نیست: {type(e).__name__}", provider="telegram") from e
 
         try:
             async for m in self.tg.raw.iter_messages(
-                entity, limit=limit, search=term, offset_date=since, reverse=False
+                entity, limit=limit, search=term, reverse=False
             ):
                 batch = messages_to_posts([m], channel=channel)
                 out.extend(self._filter_window(batch, since))
@@ -231,7 +229,11 @@ class TelegramSearch:
         except (RateLimited, DailyCapReached):
             raise
         except Exception as e:
-            log.debug("جستجو در تاریخ %s ناموفق: %s", channel.title, e)
+            from telethon import errors as tg_errors
+            if isinstance(e, tg_errors.FloodWaitError):
+                self.tg.search_limiter.block_for(e.seconds)
+                raise RateLimited(f"محدودیت Telegram: {e.seconds} ثانیه", retry_after=e.seconds, provider="telegram") from e
+            raise ProviderError(f"جستجو در تاریخ کانال: {type(e).__name__}", provider="telegram") from e
 
         return self._dedupe(out)[:limit]
 

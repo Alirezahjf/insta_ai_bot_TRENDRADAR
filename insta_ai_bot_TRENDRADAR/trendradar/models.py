@@ -386,6 +386,7 @@ class RunReport:
     started_at: datetime = field(default_factory=utcnow)
     finished_at: Optional[datetime] = None
     signals: List[TrendSignal] = field(default_factory=list)
+    posts: List[Post] = field(default_factory=list)
     channels_scanned: int = 0
     channels_discovered: int = 0
     channels_joined: int = 0
@@ -409,6 +410,7 @@ class RunReport:
             "channels_discovered": self.channels_discovered,
             "channels_joined": self.channels_joined,
             "posts_collected": self.posts_collected,
+            "posts": [p.to_dict() for p in self.posts],
             "provider_stats": self.provider_stats,
             "errors": self.errors,
             "signals": [s.to_dict() for s in self.signals],

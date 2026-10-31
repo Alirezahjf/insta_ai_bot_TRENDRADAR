@@ -142,16 +142,19 @@ class ScheduledJobRoutingTests(unittest.TestCase):
         terms = ["seed_tag", "fresh_term"]
 
         class FakeBot:
+            documents = []
             def send_message(self, *_args, **_kwargs):
                 return SimpleNamespace(message_id=99)
 
             def edit_message_text(self, *_args, **_kwargs):
                 return None
 
-            def send_document(self, *_args, **_kwargs):
+            def send_document(self, *args, **_kwargs):
+                self.documents.append((args[1].name, args[1].read()))
                 return None
 
-        with patch.object(jobs, "bot", FakeBot()), patch.object(
+        fake_bot = FakeBot()
+        with patch.object(jobs, "bot", fake_bot), patch.object(
             jobs.database, "get_schedule", return_value=schedule
         ), patch.object(jobs.database, "log_run") as log_run, patch.object(
             jobs.search_service, "generate_schedule_search_terms",
@@ -173,6 +176,12 @@ class ScheduledJobRoutingTests(unittest.TestCase):
         telegram_scan.assert_called_once_with(terms)
         pinterest_scan.assert_called_once_with(terms)
         self.assertEqual(log_run.call_args.kwargs["search_terms"], terms)
+        self.assertEqual(len(fake_bot.documents), 2)
+        payload = json.loads(fake_bot.documents[0][1])
+        self.assertEqual(len(payload["records"]), 1)
+        self.assertEqual(payload["records"][0]["platform"], "Pinterest")
+        self.assertEqual(len(payload["unified_ranking"]), 1)
+        self.assertEqual(log_run.call_args.args[1], "PARTIAL")
         self.assertEqual(log_run.call_args.args[1], "PARTIAL")
 
 

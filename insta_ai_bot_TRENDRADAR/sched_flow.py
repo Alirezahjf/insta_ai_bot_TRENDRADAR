@@ -263,7 +263,8 @@ def _show_sched_confirm(chat_id):
         f"🔢 تعداد: <b>{count}</b> | 📦 <b>{TYPE_NAMES.get(u.get('content_type'))}</b>\n"
         f"{cm_line}\n"
         f"🤖 تحلیل AI: ✅ (انتخاب تک‌پست برتر + راهنما)\n\n"
-        f"💰 هزینه هر اجرا: حدود <b>${per_run:.2f}</b> | روزی {len(times)} اجرا\n\nذخیره کنم؟",
+        f"💰 تخمین پایه: حدود <b>${per_run:.2f}</b> | روزی {len(times)} اجرا\n"
+        "⚠️ تا ۵ عبارت مرتبط با AI اضافه می‌شود؛ هزینهٔ واقعی جست‌وجو و تحلیل همهٔ نتایج ممکن است بیشتر باشد.\n\nذخیره کنم؟",
         reply_markup=kb)
 
 

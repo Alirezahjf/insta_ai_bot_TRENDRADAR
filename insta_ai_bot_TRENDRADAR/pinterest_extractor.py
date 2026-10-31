@@ -217,7 +217,7 @@ def normalize(pin: dict) -> dict:
 
     return {
         "pin_id": str(pin_id) if pin_id else "",
-        "pin_url": f"https://www.pinterest.com/pin/{pin_id}/" if pin_id else "",
+        "pin_url": f"https://www.pinterest.com/pin/{pin_id}/" if pin_id and str(pin_id).isdigit() else "",
         "image_url": img["url"],
         "image_width": img["width"],
         "image_height": img["height"],
