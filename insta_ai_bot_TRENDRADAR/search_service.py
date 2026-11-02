@@ -2,6 +2,8 @@
 
 import threading
 import asyncio
+import os
+import time
 
 import ai_service
 import database
@@ -65,7 +67,7 @@ def generate_topic_search_terms(schedule, max_keywords=5):
     database.record_schedule_keywords(schedule["id"], fresh)
     return fresh, fresh, error
 
-def scan_telegram_terms(terms, *, auto_join=False):
+def scan_telegram_terms(terms, *, auto_join=False, progress=None):
     """همان کلیدواژه‌های جست‌وجوی Instagram را روی Telegram نیز اسکن می‌کند.
 
     شکست یا نبود پیکربندی Telegram ایزوله است و نباید مانع اجرای Apify شود.
@@ -92,12 +94,22 @@ def scan_telegram_terms(terms, *, auto_join=False):
             radar = _radar
 
         # Serialize full scans: Telethon sessions and join guards are shared.
-        if not _telegram_scan_lock.acquire(blocking=False):
-            return None, "اجرای دیگر Telegram در حال انجام است؛ برای حفاظت از session این اجرا رد شد."
+        queue_timeout = _bounded_seconds("TG_SCAN_QUEUE_TIMEOUT", 900, 1, 7200)
+        deadline = time.monotonic() + queue_timeout
+        acquired = False
+        while not acquired:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, f"صف Telegram پس از {queue_timeout} ثانیه به پایان نرسید؛ جست‌وجوی این اجرا انجام نشد."
+            if progress:
+                progress("در صف تلگرام؛ اجرای دیگری در حال انجام است")
+            acquired = _telegram_scan_lock.acquire(timeout=min(5, remaining))
         try:
             join_notes = []
             if auto_join:
-                join_notes = radar._run_async(_discover_and_join(radar, hashtags))
+                join_notes = radar._run_async(_discover_and_join(radar, hashtags, progress=progress))
+            if progress:
+                progress("جست‌وجوی هشتگ در تلگرام")
             report = radar.scan(
             hashtags=hashtags,
             providers=["telegram"],
@@ -118,14 +130,26 @@ def scan_telegram_terms(terms, *, auto_join=False):
 _telegram_scan_lock = threading.Lock()
 
 
-async def _discover_and_join(radar, hashtags):
+def _bounded_seconds(name, default, minimum, maximum):
+    try:
+        return max(minimum, min(maximum, int(os.getenv(name, str(default)))))
+    except ValueError:
+        return default
+
+
+async def _discover_and_join(radar, hashtags, *, progress=None):
     """Discover by plain text, then join up to 10 candidates per term under guards."""
     from trendradar.errors import DailyCapReached, RateLimited
     provider = radar.provider("telegram")
     await provider.connect()
     seen, notes, joined = set(), [], 0
+    # Time budget prevents a single run from monopolizing the session for hours.
+    budget = _bounded_seconds("TG_JOIN_BUDGET_SECONDS", 300, 0, 7200)
+    deadline = time.monotonic() + budget
     stop = False
     for tag in hashtags:
+        if progress:
+            progress(f"کشف کانال برای {tag}؛ {joined} عضویت انجام شده")
         try:
             channels = await provider.discover_channels(tag.replace("_", " "), limit=10, min_members=0)
         except (RateLimited, DailyCapReached) as exc:
@@ -140,7 +164,13 @@ async def _discover_and_join(radar, hashtags):
             seen.add(channel.uid)
             try:
                 wait = provider.tg.join_guard.seconds_until_next_join
+                if time.monotonic() + wait > deadline:
+                    notes.append(f"بودجه زمانی عضویت ({budget} ثانیه) تمام شد؛ جست‌وجو ادامه یافت.")
+                    stop = True
+                    break
                 if wait > 0:
+                    if progress:
+                        progress(f"رعایت فاصله ایمن عضویت؛ {joined} عضویت انجام شده")
                     await asyncio.sleep(wait + 0.1)
                 result = await provider.join_channel(channel)
                 radar.storage.upsert_channel(result)

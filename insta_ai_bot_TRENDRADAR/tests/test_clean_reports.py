@@ -38,7 +38,7 @@ class AnalysisTests(unittest.TestCase):
         records = [{"id": str(n), "platform": "Instagram", "title": "x"} for n in range(31)]
         ai = FakeAI()
         with patch.object(config, "AVALAI_API_KEY", "test"), patch("ai_service.get_client", return_value=ai):
-            result = scheduled_report.analyze_all(records, ["python"])
+            result = scheduled_report.analyze_all(records, ["python"], batch_size=15)
         self.assertEqual(ai.seen, [str(n) for n in range(31)])
         self.assertEqual(result["analyzed"], 31)
         self.assertEqual(result["best_id"], "30")
@@ -47,7 +47,7 @@ class AnalysisTests(unittest.TestCase):
         records = [{"id": str(n), "platform": "Instagram"} for n in range(20)]
         ai = FakeAI(fail_batch=True)
         with patch.object(config, "AVALAI_API_KEY", "test"), patch("ai_service.get_client", return_value=ai):
-            result = scheduled_report.analyze_all(records, ["python"])
+            result = scheduled_report.analyze_all(records, ["python"], batch_size=15)
         self.assertEqual(result["analyzed"], 15)
         self.assertIsNone(result["best_id"])
         self.assertTrue(result["errors"])

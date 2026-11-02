@@ -330,7 +330,9 @@ def run_scheduled_job(schedule_id):
                 "<i>درصد تقریبی مرحله‌هاست؛ زمان پایان به سرویس‌ها بستگی دارد.</i>",
                 chat_id, status_msg.message_id)
         except Exception as exc:
-            print(f"PROGRESS UPDATE: {type(exc).__name__}")
+            # Telegram rejects an edit if the progress text has not changed.
+            if "message is not modified" not in str(exc).lower():
+                print(f"PROGRESS UPDATE: {type(exc).__name__}")
 
     try:
         status_msg = bot.send_message(chat_id, f"⏳ شروع اسکژول #{schedule_id}…")
@@ -379,7 +381,8 @@ def run_scheduled_job(schedule_id):
         ranked = scoring.compute_virality(valid_posts)
         progress(40, "کشف کانال، عضویت مجاز و جست‌وجوی Telegram" if sched.get("telegram_auto_join") else "جست‌وجوی Telegram بدون عضویت")
         try:
-            telegram_report, telegram_error = search_service.scan_telegram_terms(terms, auto_join=bool(sched.get("telegram_auto_join")))
+            telegram_report, telegram_error = search_service.scan_telegram_terms(terms, auto_join=bool(sched.get("telegram_auto_join")),
+                progress=lambda message: progress(40, message))
         except Exception as exc:
             telegram_report, telegram_error = None, type(exc).__name__
         if telegram_error:
@@ -420,10 +423,12 @@ def run_scheduled_job(schedule_id):
         if ai_winner not in relevant:
             ai_winner = None
         viral_winner = next((r for r in unified if r["platform"] == "Instagram"), None)
+        unknown = [r for r in records if r["id"] not in analysis["relevance"] or analysis["relevance"][r["id"]] is None]
+        unrelated_count = sum(analysis["relevance"].get(r["id"]) is False for r in records)
         lines = [f"✅ <b>نتیجه اسکژول #{schedule_id}</b>",
                  "━━━━━━━━━━━━━━━━━━", f"🔎 عبارت‌ها: {html.escape('، '.join(terms))}",
                  f"📊 Instagram: {len(ranked)} | Pinterest: {len(pins)} | Telegram: {getattr(telegram_report, 'posts_collected', 0)}",
-                 f"🤖 تحلیل AI: {analysis['analyzed']} از {len(records)} نتیجه | مرتبط: {len(relevant_all)}", ""]
+                 f"🤖 تحلیل AI: {analysis['analyzed']} از {len(records)} | مرتبط: {len(relevant_all)} | نامرتبط: {unrelated_count} | نامشخص: {len(unknown)}", ""]
         if ai_winner:
             lines += [f"🏆 <b>انتخاب AI از میان نتایج</b> — {html.escape(ai_winner['platform'])}",
                       html.escape(ai_winner['title'][:180] or 'بدون عنوان')]
@@ -443,6 +448,8 @@ def run_scheduled_job(schedule_id):
             return f"{position}. {html.escape(item['platform'])} | رتبه نسبی {score} | {metric_label}: {html.escape(str(metric if metric is not None else 'نامشخص'))}\n{title} — <a href=\"{url}\">مشاهده پست</a>"
 
         lines += ["", "🏆 <b>سه نتیجهٔ برتر مشترک (رتبهٔ نسبی)</b>"]
+        if unknown:
+            lines.append("⚠️ رتبه‌بندی موقت است؛ موارد نامشخص یا تحلیل‌نشده در آن حضور ندارند.")
         lines.extend(line(item, i) for i, item in enumerate(unified[:3], 1))
         if not unified:
             lines.append("نتیجهٔ مرتبط و دارای لینک معتبر برای رتبه‌بندی موجود نیست.")
@@ -457,11 +464,11 @@ def run_scheduled_job(schedule_id):
             lines += ["", "⚠️ <b>محدودیت‌ها و خطاها</b>", *["• " + html.escape(str(w)[:180]) for w in warnings[:3]]]
         # Report uses the final set of ranked records, including raw source data.
         retained_ids = {r["id"] for r in relevant_all}
-        ai_report = {**analysis, "analyses": {k: v for k, v in analysis["analyses"].items() if k in retained_ids},
-                     "relevance": {k: True for k in retained_ids}, "best_id": ai_winner["id"] if ai_winner else None,
+        ai_report = {**analysis, "analyses": {k: v for k, v in analysis["analyses"].items() if k in retained_ids | {r["id"] for r in unknown}},
+                     "relevance": {k: analysis["relevance"].get(k) for k in retained_ids | {r["id"] for r in unknown}}, "best_id": ai_winner["id"] if ai_winner else None,
                      "summary": analysis["summary"] if ai_winner else ""}
         payload = {"schedule_id": schedule_id, "topic": sched.get("topic"), "search_terms": terms,
-                   "records": relevant_all, "excluded_count": len(records) - len(relevant_all),
+                   "records": relevant_all, "excluded_count": unrelated_count, "unknown_records": unknown,
                    "ai": ai_report, "unified_ranking": [r["id"] for r in unified], "instagram_viral_winner": viral_winner,
                    "telegram": {"posts_collected": getattr(telegram_report, "posts_collected", 0)} if telegram_report else None,
                    "warnings": warnings}
@@ -472,10 +479,10 @@ def run_scheduled_job(schedule_id):
         if records:
             data = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
             data.name = f"trend_{schedule_id}_full.json"
-            bot.send_document(chat_id, data, caption="📦 گزارش کامل، داده‌ها و تحلیل همه نتایج")
-            table = io.BytesIO(scheduled_report.report_csv(relevant_all, analysis["analyses"], analysis["relevance"]))
+            bot.send_document(chat_id, data, caption="📦 نتایج مرتبط و موارد نامشخص، با جزئیات تحلیل")
+            table = io.BytesIO(scheduled_report.report_csv(relevant_all + unknown, analysis["analyses"], analysis["relevance"]))
             table.name = f"trend_{schedule_id}_analysis.csv"
-            bot.send_document(chat_id, table, caption="📊 جدول جامع نتایج و تحلیل هر مورد")
+            bot.send_document(chat_id, table, caption="📊 جدول نتایج مرتبط و نامشخص")
         state = "OK" if records and not warnings else ("PARTIAL" if records else "EMPTY")
         database.log_run(schedule_id, state, len(records), viral_winner.get("url", "") if viral_winner else "",
                          "; ".join(warnings)[:1000], search_terms=terms)

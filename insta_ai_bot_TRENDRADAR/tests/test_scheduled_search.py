@@ -173,13 +173,17 @@ class ScheduledJobRoutingTests(unittest.TestCase):
             "https://www.instagram.com/explore/tags/fresh_term/",
         ]
         self.assertEqual(scrape.call_args_list, [call(urls, "posts", 10), call(urls, "reels", 10)])
-        telegram_scan.assert_called_once_with(terms, auto_join=False)
+        telegram_scan.assert_called_once()
+        self.assertEqual(telegram_scan.call_args.args, (terms,))
+        self.assertFalse(telegram_scan.call_args.kwargs["auto_join"])
+        self.assertTrue(callable(telegram_scan.call_args.kwargs["progress"]))
         pinterest_scan.assert_called_once_with(terms)
         self.assertEqual(log_run.call_args.kwargs["search_terms"], terms)
         self.assertEqual(len(fake_bot.documents), 2)
         payload = json.loads(fake_bot.documents[0][1])
         self.assertEqual(len(payload["records"]), 0)
-        self.assertEqual(payload["excluded_count"], 1)
+        self.assertEqual(payload["excluded_count"], 0)
+        self.assertEqual(len(payload["unknown_records"]), 1)
         self.assertEqual(len(payload["unified_ranking"]), 0)
         self.assertEqual(log_run.call_args.args[1], "PARTIAL")
 
