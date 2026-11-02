@@ -186,6 +186,17 @@ class TelegramProvider(MessengerProvider):
         اگر نتیجه کم باشد، مرحله‌ی تکمیلی تاریخ کانال‌های عضو در pipeline اجرا
         می‌شود تا یک جستجو در چند لایه دوباره‌کاری نشود.
         """
+        # The public-post hashtag API is distinct from global dialog search.
+        public_search = getattr(self.search_ops, "search_public_hashtag", None)
+        if callable(public_search):
+            try:
+                public = await public_search(tag, limit=limit, since=since)
+                if public:
+                    return public
+            except (RateLimited, DailyCapReached):
+                raise
+            except Exception as exc:
+                self._search_warnings.append(f"جستجوی هشتگ عمومی #{tag}: {type(exc).__name__}")
         try:
             found = await self.search_ops.search_global(f"#{tag}", limit=limit, since=since)
         except (RateLimited, DailyCapReached):

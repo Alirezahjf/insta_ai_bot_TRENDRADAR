@@ -2,10 +2,17 @@
 import json
 import sqlite3
 import threading
+import hashlib
+import unicodedata
 from datetime import datetime
 
 _lock = threading.Lock()
 _db_path = None
+
+
+def topic_key(topic):
+    normalized = " ".join(unicodedata.normalize("NFKC", topic).casefold().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def init(path):
@@ -29,6 +36,14 @@ def init(path):
           created_at TEXT NOT NULL DEFAULT '',
           updated_at TEXT NOT NULL DEFAULT ''
         )""")
+        schedule_columns = {row[1] for row in con.execute("PRAGMA table_info(schedules)")}
+        if "topic" not in schedule_columns:
+            con.execute("ALTER TABLE schedules ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
+        if "telegram_auto_join" not in schedule_columns:
+            con.execute("ALTER TABLE schedules ADD COLUMN telegram_auto_join INTEGER NOT NULL DEFAULT 0")
+        con.execute("""CREATE TABLE IF NOT EXISTS topic_keyword_history (
+            chat_id INTEGER NOT NULL, topic_key TEXT NOT NULL, term TEXT NOT NULL,
+            created_at TEXT NOT NULL, UNIQUE(chat_id, topic_key, term))""")
         con.execute("""
         CREATE TABLE IF NOT EXISTS job_runs (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,12 +66,37 @@ def init(path):
           created_at TEXT NOT NULL,
           UNIQUE(schedule_id, term)
         )""")
+        # Preserve no-repeat behavior when upgrading pre-topic schedules.
+        from ai_service import normalize_search_keyword
+        schedules = con.execute("SELECT id, chat_id, topic, hashtags FROM schedules").fetchall()
+        for sid, chat, topic, raw_tags in schedules:
+            try:
+                tags = json.loads(raw_tags or "[]")
+                topic = (topic or "").strip() or "، ".join(tags)
+            except (ValueError, TypeError):
+                continue
+            if not topic:
+                continue
+            old_terms = [r[0] for r in con.execute("SELECT term FROM schedule_keyword_history WHERE schedule_id=?", (sid,))]
+            for (raw,) in con.execute("SELECT search_terms FROM job_runs WHERE schedule_id=?", (sid,)):
+                try:
+                    terms = json.loads(raw or "[]")
+                    if isinstance(terms, list):
+                        old_terms.extend(terms)
+                except (ValueError, TypeError):
+                    pass
+            now = datetime.now().isoformat(timespec="seconds")
+            for old in old_terms:
+                term = normalize_search_keyword(old)
+                if term:
+                    con.execute("INSERT OR IGNORE INTO topic_keyword_history (chat_id, topic_key, term, created_at) VALUES (?,?,?,?)", (chat, topic_key(topic), term, now))
+
 
 
 def _row_to_dict(row):
     keys = ["id", "chat_id", "times", "hashtags", "count_per_hashtag", "content_type",
             "want_comments", "top_n", "comments_per", "enabled", "trashed",
-            "last_triggered", "created_at", "updated_at"]
+            "last_triggered", "created_at", "updated_at", "topic", "telegram_auto_join"]
     d = dict(zip(keys, row))
     try:
         d["times"] = json.loads(d["times"] or "[]")
@@ -74,14 +114,15 @@ def create_schedule(data: dict) -> int:
     with _lock, sqlite3.connect(_db_path) as con:
         cur = con.execute("""
         INSERT INTO schedules (chat_id, times, hashtags, count_per_hashtag, content_type,
-          want_comments, top_n, comments_per, enabled, trashed, last_triggered, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,0,'',?,?)""", (
+          want_comments, top_n, comments_per, enabled, trashed, last_triggered, created_at, updated_at, topic, telegram_auto_join)
+        VALUES (?,?,?,?,?,?,?,?,?,0,'',?,?,?,?)""", (
             data["chat_id"], json.dumps(data.get("times", []), ensure_ascii=False),
             json.dumps(data.get("hashtags", []), ensure_ascii=False),
             data.get("count_per_hashtag", 20), data.get("content_type", "both"),
             1 if data.get("want_comments") else 0,
             data.get("top_n", 5), data.get("comments_per", 10),
-            1 if data.get("enabled", True) else 0, now, now))
+            1 if data.get("enabled", True) else 0, now, now, data.get("topic", ""),
+            1 if data.get("telegram_auto_join") else 0))
         return cur.lastrowid
 
 
@@ -105,12 +146,12 @@ def get_schedule(sid: int):
 def update_schedule(sid: int, data: dict):
     fields, vals = [], []
     for k in ("times", "hashtags", "count_per_hashtag", "content_type",
-              "want_comments", "top_n", "comments_per", "enabled"):
+              "want_comments", "top_n", "comments_per", "enabled", "topic", "telegram_auto_join"):
         if k in data:
             v = data[k]
             if k in ("times", "hashtags"):
                 v = json.dumps(v, ensure_ascii=False)
-            if k in ("want_comments", "enabled"):
+            if k in ("want_comments", "enabled", "telegram_auto_join"):
                 v = 1 if v else 0
             fields.append(f"{k}=?")
             vals.append(v)
@@ -192,3 +233,31 @@ def log_run(schedule_id, status, items_count=0, winner_url="", error="", search_
             schedule_id, datetime.now().isoformat(timespec="seconds"),
             status, items_count, winner_url, error[:500],
             json.dumps(search_terms or [], ensure_ascii=False)))
+
+
+def topic_history(chat_id, topic_key):
+    with _lock, sqlite3.connect(_db_path) as con:
+        return [r[0] for r in con.execute("SELECT term FROM topic_keyword_history WHERE chat_id=? AND topic_key=?", (chat_id, topic_key))]
+
+
+def reserve_topic_keywords(chat_id, topic_key, terms):
+    now = datetime.now().isoformat(timespec="seconds")
+    accepted = []
+    with _lock, sqlite3.connect(_db_path) as con:
+        for term in terms:
+            cursor = con.execute("INSERT OR IGNORE INTO topic_keyword_history (chat_id,topic_key,term,created_at) VALUES (?,?,?,?)", (chat_id, topic_key, term, now))
+            if cursor.rowcount:
+                accepted.append(term)
+    return accepted
+
+
+def get_schedule_used_terms(sid):
+    with _lock, sqlite3.connect(_db_path) as con:
+        rows = con.execute("SELECT search_terms FROM job_runs WHERE schedule_id=?", (sid,)).fetchall()
+    terms = []
+    for (raw,) in rows:
+        try:
+            terms.extend(json.loads(raw or "[]"))
+        except (ValueError, TypeError):
+            pass
+    return terms

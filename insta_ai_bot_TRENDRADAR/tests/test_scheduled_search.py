@@ -157,7 +157,7 @@ class ScheduledJobRoutingTests(unittest.TestCase):
         with patch.object(jobs, "bot", fake_bot), patch.object(
             jobs.database, "get_schedule", return_value=schedule
         ), patch.object(jobs.database, "log_run") as log_run, patch.object(
-            jobs.search_service, "generate_schedule_search_terms",
+            jobs.search_service, "generate_topic_search_terms",
             return_value=(terms, ["fresh_term"], None),
         ), patch.object(jobs.apify_service, "scrape_media", side_effect=[[], []]) as scrape, patch.object(
             jobs.search_service, "scan_telegram_terms", return_value=(None, "Telegram unavailable")
@@ -173,15 +173,14 @@ class ScheduledJobRoutingTests(unittest.TestCase):
             "https://www.instagram.com/explore/tags/fresh_term/",
         ]
         self.assertEqual(scrape.call_args_list, [call(urls, "posts", 10), call(urls, "reels", 10)])
-        telegram_scan.assert_called_once_with(terms)
+        telegram_scan.assert_called_once_with(terms, auto_join=False)
         pinterest_scan.assert_called_once_with(terms)
         self.assertEqual(log_run.call_args.kwargs["search_terms"], terms)
         self.assertEqual(len(fake_bot.documents), 2)
         payload = json.loads(fake_bot.documents[0][1])
-        self.assertEqual(len(payload["records"]), 1)
-        self.assertEqual(payload["records"][0]["platform"], "Pinterest")
-        self.assertEqual(len(payload["unified_ranking"]), 1)
-        self.assertEqual(log_run.call_args.args[1], "PARTIAL")
+        self.assertEqual(len(payload["records"]), 0)
+        self.assertEqual(payload["excluded_count"], 1)
+        self.assertEqual(len(payload["unified_ranking"]), 0)
         self.assertEqual(log_run.call_args.args[1], "PARTIAL")
 
 

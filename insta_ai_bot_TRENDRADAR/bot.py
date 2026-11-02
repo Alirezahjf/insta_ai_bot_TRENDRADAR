@@ -193,7 +193,7 @@ def handle_callback(call):
     if (d.startswith("type_") or d in ("cm_yes", "cm_no") or d.startswith("top_")
             or d.startswith("cpc_") or d.startswith("confirm_")):
         handled = instant_flow.on_callback(call, u)
-    elif (d.startswith("stype_") or d.startswith("scm_") or d.startswith("stop_")
+    elif (d.startswith("topic_") or d.startswith("stype_") or d.startswith("scm_") or d.startswith("stop_")
             or d.startswith("scpc_") or d.startswith("sch")):
         handled = sched_flow.on_callback(call, u)
     elif (d.startswith("run_") or d.startswith("dlc_") or d.startswith("dlj_")

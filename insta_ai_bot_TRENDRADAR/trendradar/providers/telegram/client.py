@@ -315,6 +315,7 @@ class TrendTelegramClient:
         req: Any,
         *,
         rate_limit: bool = True,
+        translate_rpc: bool = True,
         retries: int = 2,
         retry_delay: float = 2.0,
     ) -> Any:
@@ -366,6 +367,8 @@ class TrendTelegramClient:
                     log.debug("خطای گذرا (تلاش %d/%d): %s", attempt, retries, e)
                     await asyncio.sleep(retry_delay * attempt)
                     continue
+                if not translate_rpc:
+                    raise
                 raise self._translate(e) from e
             except (ConnectionError, OSError) as e:
                 if attempt <= retries:

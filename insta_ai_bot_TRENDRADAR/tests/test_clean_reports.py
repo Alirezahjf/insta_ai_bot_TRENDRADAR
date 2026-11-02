@@ -26,7 +26,7 @@ class FakeAI:
             self.seen.extend(p["id"] for p in posts)
             if self.fail_batch and len(self.seen) > 15:
                 raise RuntimeError("failure")
-            result = {"analyses": [{"id": p["id"], "analysis": "تحلیل"} for p in posts],
+            result = {"analyses": [{"id": p["id"], "analysis": "تحلیل", "relevant": True} for p in posts],
                       "best_id": posts[-1]["id"], "reason": "دلیل"}
         else:
             result = {"best_id": data["batch_winners"][-1]["id"], "summary": "نتیجه"}

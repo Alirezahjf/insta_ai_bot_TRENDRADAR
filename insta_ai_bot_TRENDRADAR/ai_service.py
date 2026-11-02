@@ -216,3 +216,17 @@ def test_connection(model=None):
         return True, (resp.choices[0].message.content or "").strip()[:100]
     except Exception as e:
         return False, str(e)[:300]
+
+
+def generate_topic_keywords(topic, *, excluded_terms=(), max_keywords=5):
+    """Generate topic-specific search tags; the caller checks all historical terms."""
+    if not config.AVALAI_API_KEY:
+        return [], "کلید AvalAI تنظیم نشده است"
+    try:
+        response = get_client().chat.completions.create(
+            model=config.AVALAI_MODEL, temperature=0.35, max_tokens=500, timeout=30,
+            messages=[{"role": "system", "content": "موضوع ورودی را دقیق رعایت کن. برای جست‌وجو در اینستاگرام، پینترست و تلگرام هشتگ‌های مرتبط، متنوع و تازه تولید کن. از تغییر موضوع یا حدس دربارهٔ نام مبهم اجتناب کن. فقط JSON با کلید keywords و آرایهٔ رشته‌ها بده."},
+                      {"role": "user", "content": json.dumps({"topic": topic, "previous_terms_do_not_repeat": list(excluded_terms)[-200:], "max_keywords": max_keywords}, ensure_ascii=False)}])
+        return _unique_search_keywords(_parse_keyword_response(response.choices[0].message.content or ""), excluded=excluded_terms, limit=max_keywords), None
+    except Exception as exc:
+        return [], type(exc).__name__

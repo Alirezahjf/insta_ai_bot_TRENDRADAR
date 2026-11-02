@@ -111,6 +111,23 @@ class TelegramSearch:
     # ۲) جستجوی **سراسری** — بدون نیاز به عضو بودن
     #    متد واقعی: messages.SearchGlobalRequest  [id=0x6126a43c]
     # ═════════════════════════════════════════════════════════
+    async def search_public_hashtag(self, tag: str, *, limit=50, since=None):
+        """Telegram public hashtag posts API; one bounded page, no paid stars."""
+        functions, types = _import()
+        request_type = getattr(functions.channels, "SearchPostsRequest", None)
+        if request_type is None:
+            raise ProviderError("نسخه Telethon متد SearchPostsRequest را ندارد", provider="telegram")
+        request = request_type(offset_rate=0, offset_peer=types.InputPeerEmpty(), offset_id=0,
+                               limit=min(100, max(1, limit)), hashtag=normalize_hashtag(tag))
+        result = await self.tg.request(request)
+        chat_index = self._chat_index(getattr(result, "chats", None) or [])
+        posts = []
+        for message in getattr(result, "messages", None) or []:
+            channel = self._channel_of_message(message, chat_index)
+            if channel:
+                posts.extend(self._filter_window(messages_to_posts([message], channel=channel), since))
+        return self._dedupe(posts)[:limit]
+
     async def search_global(
         self,
         term: str,
