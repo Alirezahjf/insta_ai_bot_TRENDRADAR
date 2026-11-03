@@ -56,7 +56,7 @@ class JoinSequenceTests(unittest.TestCase):
         calls = []
         channels = [SimpleNamespace(uid=str(i), joined=False, title=str(i)) for i in range(2)]
         class Provider:
-            tg = SimpleNamespace(join_guard=SimpleNamespace(seconds_until_next_join=0))
+            tg = SimpleNamespace(join_guard=SimpleNamespace(seconds_until_next_join=0, counter=SimpleNamespace(remaining=10)))
             async def connect(self): calls.append("connect")
             async def discover_channels(self, query, **kwargs):
                 calls.append(("discover", query, kwargs["limit"]))
@@ -66,10 +66,11 @@ class JoinSequenceTests(unittest.TestCase):
                 channel.joined = True
                 return channel
             def export_state(self): return {}
-        storage = SimpleNamespace(upsert_channel=lambda c: None, save_provider_state=lambda *args: None)
+        storage = SimpleNamespace(upsert_channel=lambda c: None, save_provider_state=lambda *args: None, get_channels=lambda **kw: [])
         radar = SimpleNamespace(provider=lambda name: Provider(), storage=storage)
-        notes = asyncio.run(search_service._discover_and_join(radar, ["casual_style", "men_style"]))
-        self.assertEqual(calls, ["connect", ("discover", "casual style", 10), ("join", "0"), ("join", "1"), ("discover", "men style", 10)])
+        result = asyncio.run(search_service._discover_and_join(radar, ["casual_style", "men_style"], auto_join=True))
+        notes = result.notes
+        self.assertEqual(calls, ["connect", ("discover", "casual style", 10), ("discover", "men style", 10), ("join", "0"), ("join", "1")])
         self.assertIn("2", notes[-1])
 
 
@@ -154,14 +155,14 @@ class ScheduledOutputTests(unittest.TestCase):
                     "relevance": {r["id"]: r["platform"] == "Instagram" for r in records},
                     "best_id": records[0]["id"], "summary": "مرتبط", "analyzed": len(records), "errors": []}
         with patch.object(jobs, "bot", bot), patch.object(jobs.database, "get_schedule", return_value=schedule), \
-             patch.object(jobs.database, "log_run") as log, \
+             patch.object(jobs.database, "log_run") as log, patch.object(jobs.database, "topic_terms_for_platform", side_effect=lambda c,k,p,t: t), patch.object(jobs.database, "reserve_post_records", side_effect=lambda c,k,r,run: (r, [])), patch.object(jobs.database, "complete_post_records"), patch.object(jobs.database, "record_keyword_platform_result"), \
              patch.object(jobs.search_service, "generate_topic_search_terms", return_value=(["python_news"], [], None)), \
              patch.object(jobs.search_service, "scan_telegram_terms", return_value=(None, "")), \
              patch.object(jobs.apify_service, "scrape_media", return_value=[
                  {"url": "https://www.instagram.com/explore/tags/python/"},
                  {"url": "https://www.instagram.com/p/abc123/", "caption": "python", "likesCount": 3}]), \
              patch.object(jobs.pinterest_service, "scan_pinterest_terms", return_value=([
-                 {"pin_url": "https://pinterest.com/pin/123/", "title": "نامرتبط", "score": 20}], [])), \
+                 {"pin_url": "https://pinterest.com/pin/123/", "title": "نامرتبط", "score": 20}], [], {"queries": [], "term_results": {}})), \
              patch.object(jobs.scheduled_report, "analyze_all", side_effect=classify):
             jobs.run_scheduled_job(11)
         self.assertEqual(len(bot.docs), 2)

@@ -70,11 +70,40 @@ class TelegramSearch:
         if not tag or limit <= 0:
             return []
         posts = await self.search_in_chat_history(
-            channel, tag, limit=limit, since=since
+            channel, f"#{tag}", limit=limit, since=since
         )
         exact = [post for post in posts if tag in post.hashtags]
+        for post in exact:
+            post.extra.setdefault("match_mode", "hashtag")
+            post.extra.setdefault("matched_search_term", tag)
         log.debug("  #%s در «%s» → %d پست", tag, channel.title, len(exact))
         return exact[:limit]
+
+    async def search_hashtag_with_fallback(
+        self, channel: ChannelRef, tag: str, *, limit: int = 50,
+        since: Optional[datetime] = None,
+    ) -> List[Post]:
+        """Hashtag first; plain-text fallback only after a successful empty search.
+
+        Telegram errors are not treated as "no results". The fallback runs in the
+        same channel and uses the project's real iter_messages(search=...) path.
+        """
+        from search_identity import plain_search_text
+        tag = normalize_hashtag(tag)
+        if not tag or limit <= 0:
+            return []
+        exact = await self.search_hashtag_in_channel(channel, tag, limit=limit, since=since)
+        if exact:
+            return exact
+        query = plain_search_text(tag)
+        if not query:
+            return []
+        posts = await self.search_in_chat_history(channel, query, limit=limit, since=since)
+        for post in posts:
+            post.extra["match_mode"] = "plain_text"
+            post.extra["matched_search_term"] = tag
+            post.extra["matched_query"] = query
+        return self._dedupe(posts)[:limit]
 
     async def search_hashtag_in_channels(
         self,
@@ -220,7 +249,7 @@ class TelegramSearch:
         برای کانال‌هایی کاربرد دارد که پست‌هایشان در ایندکس هشتگ
         تلگرام نیست (کانال‌های خصوصی، گروه‌های بسته).
         """
-        term = (term or "").strip().lstrip("#")
+        term = (term or "").strip()
         if not term:
             return []
 

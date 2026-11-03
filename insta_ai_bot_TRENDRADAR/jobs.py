@@ -17,6 +17,7 @@ import search_service
 import pinterest_service
 import unified_ranking
 import scheduled_report
+import instagram_media
 from core import bot, fmt_num, main_menu, reset_user, send_long, tehran_now, to_hashtag_urls
 
 TYPE_NAMES = {"posts": "📷 پست", "reels": "🎬 ریلز", "both": "📷+🎬 پست و ریلز"}
@@ -300,7 +301,7 @@ def run_pipeline(chat_id, cfg):
 # ⏰ جاب اسکژول‌شده: اسکرپ + وایرال‌اسکور + کامنت + تحلیل AI
 # ============================================================
 def run_scheduled_job(schedule_id):
-    """A single progress message, one clear result, and at most two report files."""
+    """One scheduled run: search, deduplicate, analyze only eligible posts, report."""
     sched = database.get_schedule(schedule_id)
     if not sched or sched["trashed"]:
         return
@@ -310,13 +311,14 @@ def run_scheduled_job(schedule_id):
     warnings = []
     status_msg = None
     started = time.monotonic()
+    run_id = f"schedule-{schedule_id}-{int(time.time())}"
     progress_state = {"percent": 0, "stage": "شروع"}
     progress_lock = threading.Lock()
     heartbeat_stop = threading.Event()
     heartbeat = None
 
     def progress(percent, stage):
-        if status_msg is None:
+        if status_msg is None or heartbeat_stop.is_set():
             return
         try:
             percent = max(0, min(100, int(percent)))
@@ -330,7 +332,6 @@ def run_scheduled_job(schedule_id):
                 "<i>درصد تقریبی مرحله‌هاست؛ زمان پایان به سرویس‌ها بستگی دارد.</i>",
                 chat_id, status_msg.message_id)
         except Exception as exc:
-            # Telegram rejects an edit if the progress text has not changed.
             if "message is not modified" not in str(exc).lower():
                 print(f"PROGRESS UPDATE: {type(exc).__name__}")
 
@@ -343,7 +344,9 @@ def run_scheduled_job(schedule_id):
                 progress(percent, stage)
         heartbeat = threading.Thread(target=heartbeat_loop, daemon=True)
         heartbeat.start()
-        progress(5, "در حال گسترش هوشمند موضوع جست‌وجو")
+        progress(5, "در حال گسترش موضوع و بررسی عبارت‌های قابل تلاش مجدد")
+        topic = sched.get("topic") or "، ".join(sched.get("hashtags") or [])
+        topic_key_value = database.topic_key(topic)
         try:
             terms, _fresh, error = search_service.generate_topic_search_terms(sched, max_keywords=5)
             if error:
@@ -352,50 +355,84 @@ def run_scheduled_job(schedule_id):
             terms = []
             warnings.append(f"پیشنهاد AI: {type(exc).__name__}")
         if not terms:
-            raise ValueError("عبارت تازه‌ای برای جست‌وجو تولید نشد")
-        urls = to_hashtag_urls(terms)
+            raise ValueError("عبارت تازه یا قابل تلاش مجدد برای جست‌وجو وجود ندارد")
+        ig_terms = database.topic_terms_for_platform(chat_id, topic_key_value, "instagram", terms)
+        tg_terms = database.topic_terms_for_platform(chat_id, topic_key_value, "telegram", terms)
+        pin_terms = database.topic_terms_for_platform(chat_id, topic_key_value, "pinterest", terms)
         media = []
         kinds = [k for k in ("posts", "reels") if sched.get("content_type") in (k, "both")]
-        for i, kind in enumerate(kinds):
-            progress(15 + i * 12, f"دریافت {kind} از Instagram ({i+1}/{len(kinds)})")
-            try:
-                media.extend(apify_service.scrape_media(urls, kind, sched["count_per_hashtag"]))
-            except Exception as exc:
-                warnings.append(f"Instagram {kind}: {type(exc).__name__}: {str(exc)[:100]}")
-        # Avoid double counting the same post returned by multiple searches.
-        seen, unique = set(), []
+        ig_success = False
+        if ig_terms and kinds:
+            urls = to_hashtag_urls(ig_terms)
+            for i, kind in enumerate(kinds):
+                progress(15 + i * 12, f"دریافت {kind} از Instagram ({i+1}/{len(kinds)})")
+                try:
+                    media.extend(apify_service.scrape_media(urls, kind, sched["count_per_hashtag"]))
+                    ig_success = True
+                except Exception as exc:
+                    warnings.append(f"Instagram {kind}: {type(exc).__name__}")
+            database.record_keyword_platform_result(chat_id, topic_key_value, ig_terms, "instagram",
+                                                    "succeeded" if ig_success else "failed",
+                                                    "" if ig_success else "all requested kinds failed", run_id)
+        elif ig_terms:
+            warnings.append("Instagram: نوع محتوای معتبر تنظیم نشده است.")
+            database.record_keyword_platform_result(chat_id, topic_key_value, ig_terms, "instagram", "failed", "invalid content_type", run_id)
+        else:
+            warnings.append("Instagram: عبارت جدید یا قابل تلاش مجدد وجود نداشت؛ جست‌وجوی تکراری انجام نشد.")
+        seen, unique_media = set(), []
         for item in media:
-            key = item.get("shortCode") or item.get("url") or item.get("id")
-            if key and str(key) in seen:
+            identity = scheduled_report.record_identity({"platform": "Instagram", "url": item.get("url"), "raw": item})
+            key = identity["key"] if identity else None
+            if key and key in seen:
                 continue
             if key:
-                seen.add(str(key))
-            unique.append(item)
-        valid_posts = []
-        for item in unique:
-            url = apify_service.clean_post_url(item)
-            if url:
-                valid_posts.append({**item, "url": url})
-        if len(valid_posts) != len(unique):
-            warnings.append(f"Instagram: {len(unique) - len(valid_posts)} نتیجهٔ فاقد لینک معتبر پست کنار گذاشته شد.")
+                seen.add(key)
+                item = dict(item)
+                item["url"] = identity["url"]
+            unique_media.append(item)
+        valid_posts = [item for item in unique_media if scheduled_report.valid_post_url({"platform": "Instagram", "url": item.get("url"), "raw": item})]
+        if len(valid_posts) != len(unique_media):
+            warnings.append(f"Instagram: {len(unique_media) - len(valid_posts)} نتیجهٔ فاقد لینک معتبر پست کنار گذاشته شد.")
         ranked = scoring.compute_virality(valid_posts)
-        progress(40, "کشف کانال، عضویت مجاز و جست‌وجوی Telegram" if sched.get("telegram_auto_join") else "جست‌وجوی Telegram بدون عضویت")
-        try:
-            telegram_report, telegram_error = search_service.scan_telegram_terms(terms, auto_join=bool(sched.get("telegram_auto_join")),
-                progress=lambda message: progress(40, message))
-        except Exception as exc:
-            telegram_report, telegram_error = None, type(exc).__name__
-        if telegram_error:
-            warnings.append(f"Telegram: {telegram_error}")
-        if telegram_report:
-            warnings.extend(f"Telegram: {e}" for e in telegram_report.errors)
-        progress(55, "جست‌وجوی Pinterest")
-        try:
-            pins, pin_errors = pinterest_service.scan_pinterest_terms(terms)
-            warnings.extend(f"Pinterest: {e}" for e in pin_errors)
-        except Exception as exc:
-            pins = []
-            warnings.append(f"Pinterest: {type(exc).__name__}")
+        progress(40, "کشف کانال، عضویت مجاز و جست‌وجوی هشتگ/متن Telegram")
+        telegram_report = None
+        if tg_terms:
+            try:
+                telegram_report, telegram_error = search_service.scan_telegram_terms(
+                    tg_terms, auto_join=bool(sched.get("telegram_auto_join")), schedule_id=schedule_id,
+                    progress=lambda message: progress(40, message))
+            except Exception as exc:
+                telegram_report, telegram_error = None, type(exc).__name__
+            if telegram_error:
+                warnings.append(f"Telegram: {telegram_error}")
+            if telegram_report:
+                warnings.extend(f"Telegram: {e}" for e in telegram_report.errors)
+                for term in tg_terms:
+                    status = getattr(telegram_report, "term_results", {}).get(term, "failed")
+                    database.record_keyword_platform_result(chat_id, topic_key_value, [term], "telegram",
+                                                            "succeeded" if status == "succeeded" else "failed",
+                                                            "" if status == "succeeded" else status, run_id)
+            else:
+                database.record_keyword_platform_result(chat_id, topic_key_value, tg_terms, "telegram", "failed", telegram_error, run_id)
+        else:
+            warnings.append("Telegram: عبارت جدید یا قابل تلاش مجدد وجود نداشت؛ جست‌وجوی تکراری انجام نشد.")
+        progress(55, "ترجمه و جست‌وجوی Pinterest")
+        pins, pin_audit = [], {"queries": [], "term_results": {}}
+        if pin_terms:
+            try:
+                pins, pin_errors, pin_audit = pinterest_service.scan_pinterest_terms(pin_terms, topic=topic, return_queries=True)
+                warnings.extend(f"Pinterest: {e}" for e in pin_errors)
+            except Exception as exc:
+                pins = []
+                warnings.append(f"Pinterest: {type(exc).__name__}")
+                pin_audit["term_results"] = {term: "failed" for term in pin_terms}
+            for term in pin_terms:
+                status = pin_audit.get("term_results", {}).get(term, "failed")
+                if status in ("succeeded", "failed"):
+                    database.record_keyword_platform_result(chat_id, topic_key_value, [term], "pinterest", status,
+                                                            "" if status == "succeeded" else "search/translation failed", run_id)
+        else:
+            warnings.append("Pinterest: عبارت جدید یا قابل تلاش مجدد وجود نداشت؛ جست‌وجوی تکراری انجام نشد.")
         grouped, comments = {}, []
         if sched.get("want_comments") and ranked:
             progress(65, "دریافت نمونه کامنت پست‌های برتر Instagram")
@@ -408,97 +445,112 @@ def run_scheduled_job(schedule_id):
             except Exception as exc:
                 warnings.append(f"کامنت‌ها: {type(exc).__name__}")
         records = scheduled_report.build_records(ranked, pins, telegram_report, grouped)
-        progress(70, f"آماده‌سازی تحلیل {len(records)} نتیجه")
+        records, run_duplicates = scheduled_report.dedupe_records(records)
+        progress(70, f"حذف تکراری‌ها و آماده‌سازی تحلیل {len(records)} نتیجه")
+        new_records, previous_skipped = database.reserve_post_records(chat_id, topic_key_value, records, run_id)
         analysis = scheduled_report.analyze_all(
-            records, terms, topic=sched.get("topic") or "، ".join(sched.get("hashtags") or []),
-            progress=lambda i, n: progress(70 + int(20 * (i - 1) / max(n, 1)),
-                                            f"تحلیل هوشمند دسته {i} از {n}"))
+            new_records, terms, topic=topic,
+            progress=lambda i, n: progress(70 + int(15 * (i - 1) / max(n, 1)), f"تحلیل هوشمند دسته {i} از {n}"))
         warnings.extend(analysis["errors"])
-        for item in records:
-            # Text-only AI cannot infer image/video contents from an empty caption.
-            if item["platform"] == "Telegram" and item.get("media_type") in ("photo", "video") and not item.get("title", "").strip():
-                analysis["relevance"][item["id"]] = None
-        relevant_all = [r for r in records if analysis["relevance"].get(r["id"]) is True]
-        relevant = [r for r in relevant_all if r["platform"] == "Telegram" or scheduled_report.valid_post_url(r)]
-        unified = scheduled_report.rank_records(relevant)
-        progress(94, "تهیه نتیجه و فایل‌های جامع")
-        by_id = {r["id"]: r for r in records}
+        # Server-side guard: text-only AI cannot classify captionless media as relevant.
+        for item in new_records:
+            if item.get("media_type") in ("photo", "video", "image", "sidecar") and not item.get("text_available", True):
+                if item["id"] in analysis.get("relevance", {}):
+                    analysis["relevance"][item["id"]] = None
+                    detail = analysis.setdefault("analysis_details", {}).setdefault(item["id"], {})
+                    limits = detail.setdefault("data_limits", [])
+                    note = "متن کافی وجود ندارد و تحلیل بصری انجام نشده است."
+                    if note not in limits:
+                        limits.append(note)
+        database.complete_post_records(chat_id, topic_key_value, new_records, analysis, run_id)
+        relevant_all = [r for r in new_records if analysis["relevance"].get(r["id"]) is True]
+        unified = scheduled_report.rank_records(relevant_all)
+        progress(92, "تهیه نتیجه و فایل‌های جامع")
+        by_id = {r["id"]: r for r in new_records}
         ai_winner = by_id.get(analysis.get("best_id"))
-        if ai_winner not in relevant:
+        if ai_winner not in relevant_all:
             ai_winner = None
         viral_winner = next((r for r in unified if r["platform"] == "Instagram"), None)
-        unknown = [r for r in records if r["id"] not in analysis["relevance"] or analysis["relevance"][r["id"]] is None]
-        unrelated_count = sum(analysis["relevance"].get(r["id"]) is False for r in records)
+        unknown = [r for r in new_records if r["id"] in analysis.get("relevance", {}) and analysis["relevance"][r["id"]] is None]
+        unanalyzed = [r for r in new_records if r["id"] not in analysis.get("relevance", {})]
+        unrelated_count = sum(analysis["relevance"].get(r["id"]) is False for r in new_records)
+        failed_analysis = len(new_records) - analysis["analyzed"]
+        translated = sum(q["status"] == "translated" for q in pin_audit.get("queries", []))
         lines = [f"✅ <b>نتیجه اسکژول #{schedule_id}</b>",
                  "━━━━━━━━━━━━━━━━━━", f"🔎 عبارت‌ها: {html.escape('، '.join(terms))}",
-                 f"📊 Instagram: {len(ranked)} | Pinterest: {len(pins)} | Telegram: {getattr(telegram_report, 'posts_collected', 0)}",
-                 f"🤖 تحلیل AI: {analysis['analyzed']} از {len(records)} | مرتبط: {len(relevant_all)} | نامرتبط: {unrelated_count} | نامشخص: {len(unknown)}", ""]
+                 f"📊 نتایج خام: Instagram {len(ranked)} | Pinterest {len(pins)} | Telegram {getattr(telegram_report, 'posts_collected', 0)}",
+                 f"🔁 تکراری همین اجرا: {run_duplicates} | قبلاً پردازش‌شده: {len(previous_skipped)}",
+                 f"🆕 تحلیل جدید: {analysis['analyzed']} از {len(new_records)} | مرتبط: {len(relevant_all)} | نامرتبط: {unrelated_count} | نامشخص: {len(unknown)} | تحلیل‌نشده: {failed_analysis}",
+                 f"🌐 ترجمه Pinterest: {translated} عبارت"]
         if ai_winner:
-            lines += [f"🏆 <b>انتخاب AI از میان نتایج</b> — {html.escape(ai_winner['platform'])}",
+            lines += [f"🏆 <b>انتخاب AI</b> — {html.escape(ai_winner['platform'])}",
                       html.escape(ai_winner['title'][:180] or 'بدون عنوان')]
             if ai_winner.get("url"):
                 lines.append(html.escape(ai_winner["url"]))
             if analysis.get("summary"):
                 lines.append(html.escape(analysis["summary"][:300]))
-            lines.append("<i>انتخاب مرحله‌ای و وابسته به داده موجود است؛ امتیاز پلتفرم‌ها مستقیماً قابل مقایسه نیست.</i>")
         else:
-            lines.append("⚠️ انتخاب نهایی AI در دسترس نیست؛ جزئیات در گزارش آمده است.")
+            lines.append("⚠️ انتخاب نهایی AI در دسترس نیست؛ جزئیات در فایل گزارش آمده است.")
         def line(item, position):
             title = html.escape((item.get("title") or "بدون عنوان")[:85])
-            url = html.escape(item["url"], quote=True)
             score = item.get("relative_score")
             metric = item.get("viral_score") if item["platform"] == "Instagram" else item.get("platform_score") if item["platform"] == "Pinterest" else item.get("views")
             metric_label = {"Instagram": "وایرال", "Pinterest": "امتیاز پین", "Telegram": "بازدید"}[item["platform"]]
-            link = f'<a href="{url}">مشاهده پست</a>' if scheduled_report.valid_post_url(item) else "لینک مستقیم موجود نیست"
-            return f"{position}. {html.escape(item['platform'])} | رتبه نسبی {score} | {metric_label}: {html.escape(str(metric if metric is not None else 'نامشخص'))}\n{title} — {link}"
-
+            link = f'<a href="{html.escape(item["url"], quote=True)}">مشاهده پست</a>' if item.get("url") else "لینک مستقیم موجود نیست"
+            reason = html.escape((analysis.get("analysis_details", {}).get(item["id"], {}).get("reason") or "")[:140])
+            return (f"{position}. {html.escape(item['platform'])} | رتبه نسبی {score} | {metric_label}: {html.escape(str(metric if metric is not None else 'نامشخص'))}\n"
+                    f"{title} — {link}" + (f"\n💡 {reason}" if reason else ""))
         lines += ["", "🏆 <b>سه نتیجهٔ برتر مشترک (رتبهٔ نسبی)</b>"]
-        if unknown:
-            lines.append("⚠️ رتبه‌بندی موقت است؛ موارد نامشخص یا تحلیل‌نشده در آن حضور ندارند.")
+        if unknown or failed_analysis:
+            lines.append("⚠️ رتبه‌بندی موقت است؛ موارد نامشخص/تحلیل‌نشده در آن حضور ندارند.")
         lines.extend(line(item, i) for i, item in enumerate(unified[:3], 1))
         if not unified:
-            lines.append("نتیجهٔ مرتبط و دارای لینک معتبر برای رتبه‌بندی موجود نیست.")
+            lines.append("نتیجهٔ مرتبط جدید برای رتبه‌بندی موجود نیست.")
         for platform in ("Instagram", "Pinterest", "Telegram"):
             items = [r for r in unified if r["platform"] == platform][:3]
             lines += ["", f"📌 <b>برترین‌های {platform}</b>"]
             lines.extend(line(item, i) for i, item in enumerate(items, 1))
             if not items:
-                lines.append("نتیجهٔ مرتبط در دسترس نیست." if platform == "Telegram" else "نتیجهٔ مرتبطِ دارای لینک در دسترس نیست.")
-        unknown_tg_media = [r for r in unknown if r["platform"] == "Telegram" and r.get("media_type") in ("photo", "video")]
-        tg_media_count = sum(r["platform"] == "Telegram" and r.get("media_type") in ("photo", "video") for r in relevant_all + unknown)
-        if tg_media_count:
-            lines += ["", f"📷 {tg_media_count} رسانهٔ مرتبط یا نامشخص تلگرام ثبت شد؛ حداکثر ۳ مورد جداگانه ارسال می‌شود."]
-        lines.append("<i>رتبه‌ها نسبی درون هر پلتفرم‌اند، نه وایرال‌اسکور قابل‌مقایسه. AI فقط متن و آمار را بررسی می‌کند، نه محتوای تصویر/ویدئو.</i>")
+                lines.append("نتیجهٔ مرتبط جدید در دسترس نیست.")
+        lines.append("<i>رتبه‌ها نسبی درون هر پلتفرم‌اند. AI فقط متن و آمار را بررسی می‌کند، نه محتوای تصویر/ویدئو.</i>")
         if warnings:
-            lines += ["", "⚠️ <b>محدودیت‌ها و خطاها</b>", *["• " + html.escape(str(w)[:180]) for w in warnings[:3]]]
-        # Report uses the final set of ranked records, including raw source data.
-        retained_ids = {r["id"] for r in relevant_all}
-        ai_report = {**analysis, "analyses": {k: v for k, v in analysis["analyses"].items() if k in retained_ids | {r["id"] for r in unknown}},
-                     "relevance": {k: analysis["relevance"].get(k) for k in retained_ids | {r["id"] for r in unknown}}, "best_id": ai_winner["id"] if ai_winner else None,
-                     "summary": analysis["summary"] if ai_winner else ""}
-        payload = {"schedule_id": schedule_id, "topic": sched.get("topic"), "search_terms": terms,
-                   "records": relevant_all, "excluded_count": unrelated_count, "unknown_records": unknown,
-                   "ai": ai_report, "unified_ranking": [r["id"] for r in unified], "instagram_viral_winner": viral_winner,
-                   "telegram": {"posts_collected": getattr(telegram_report, "posts_collected", 0)} if telegram_report else None,
-                   "warnings": warnings}
+            lines += ["", "⚠️ <b>محدودیت‌ها و خطاها</b>", *["• " + html.escape(str(w)[:160]) for w in warnings[:3]]]
+        # Trim by complete lines so HTML tags/entities are never cut in half.
+        message, used = "", 0
+        for line in lines:
+            if used + len(line) + 1 > 3800:
+                message += "\n… ادامه و تحلیل کامل در فایل JSON"
+                break
+            message += line + "\n"
+            used += len(line) + 1
+        message = message.rstrip()
         heartbeat_stop.set()
         if heartbeat:
             heartbeat.join(timeout=5)
-        bot.edit_message_text("\n".join(lines), chat_id, status_msg.message_id, disable_web_page_preview=True)
-        # Send up to three Telegram media separately; absence of a permalink
-        # must never exclude a post from statistics or ranking.
+        bot.edit_message_text(message, chat_id, status_msg.message_id, disable_web_page_preview=True)
+        progress(95, "ارسال رسانه‌های برتر")
+        ig_media = [r for r in unified if r["platform"] == "Instagram"][:3]
+        ig_delivery = instagram_media.send_instagram_media(bot, chat_id, ig_media, analysis)
+        for delivery in ig_delivery:
+            if delivery["status"] != "sent":
+                warnings.append(f"رسانه Instagram #{delivery['rank']}: {'؛ '.join(delivery['details'])}")
+        unknown_tg_media = [r for r in unknown if r["platform"] == "Telegram" and r.get("media_type") in ("photo", "video")]
         tg_media = [r for r in unified if r["platform"] == "Telegram" and r.get("media_type") in ("photo", "video")]
         tg_media.extend(sorted(unknown_tg_media, key=lambda r: -(r.get("views") or 0)))
+        tg_delivery = []
         for index, item in enumerate(tg_media[:3], 1):
             flag = analysis["relevance"].get(item["id"])
             status = "مرتبط بر اساس متن" if flag is True else "ارتباط نامشخص؛ بررسی دستی لازم است"
             caption = (f"📡 <b>رسانهٔ Telegram #{index}</b> | {html.escape(status)}\n"
                        f"{html.escape(str(item.get('channel_title') or 'کانال نامشخص')[:100])}\n"
                        f"{html.escape(str(item.get('title') or 'بدون متن')[:300])}")
+            if item.get("url"):
+                caption += f"\n🔗 {html.escape(item['url'])}"
+            delivery = {"id": item["id"], "rank": index, "status": "sent"}
             try:
                 content, error = search_service.fetch_telegram_media(item)
                 if error:
-                    warnings.append(f"رسانه Telegram {index}: {error}")
+                    delivery.update(status="unavailable", detail=error)
                     bot.send_message(chat_id, caption + "\n⚠️ رسانه قابل ارسال نیست: " + html.escape(error))
                 else:
                     data = io.BytesIO(content)
@@ -508,32 +560,65 @@ def run_scheduled_job(schedule_id):
                     else:
                         bot.send_video(chat_id, data, caption=caption)
             except Exception as exc:
-                warnings.append(f"رسانه Telegram {index}: {type(exc).__name__}")
+                delivery.update(status="send_failed", detail=type(exc).__name__)
                 try:
                     bot.send_message(chat_id, caption + "\n⚠️ ارسال رسانه ناموفق بود.")
                 except Exception:
                     pass
-        if records:
+            tg_delivery.append(delivery)
+            if index < min(len(tg_media), 3):
+                time.sleep(1)
+        retained_ids = {r["id"] for r in relevant_all} | {r["id"] for r in unknown} | {r["id"] for r in unanalyzed}
+        ai_report = {**analysis,
+                     "analyses": {k: v for k, v in analysis["analyses"].items() if k in retained_ids},
+                     "analysis_details": {k: v for k, v in analysis.get("analysis_details", {}).items() if k in retained_ids},
+                     "relevance": {k: analysis["relevance"].get(k) for k in retained_ids},
+                     "best_id": ai_winner["id"] if ai_winner else None,
+                     "summary": analysis["summary"] if ai_winner else ""}
+        payload = {"schedule_id": schedule_id, "topic": sched.get("topic"), "search_terms": terms,
+                   "platform_terms": {"instagram": ig_terms, "telegram": tg_terms, "pinterest": pin_terms},
+                   "records": relevant_all, "excluded_count": unrelated_count, "unknown_records": unknown,
+                   "run_duplicate_count": run_duplicates, "previous_processed_count": len(previous_skipped),
+                   "unanalyzed_records": unanalyzed,
+                   "previous_processed_records": previous_skipped, "failed_analysis_count": failed_analysis,
+                   "pinterest_queries": pin_audit.get("queries", []), "ai": ai_report,
+                   "unified_ranking": [r["id"] for r in unified], "instagram_viral_winner": viral_winner,
+                   "instagram_media_delivery": ig_delivery, "telegram_media_delivery": tg_delivery,
+                   "telegram": {"posts_collected": getattr(telegram_report, "posts_collected", 0),
+                                "stats": getattr(telegram_report, "provider_stats", {}).get("telegram", {})} if telegram_report else None,
+                   "warnings": warnings}
+        if new_records or previous_skipped:
             data = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
             data.name = f"trend_{schedule_id}_full.json"
-            bot.send_document(chat_id, data, caption="📦 نتایج مرتبط و موارد نامشخص، با جزئیات تحلیل")
-            table = io.BytesIO(scheduled_report.report_csv(relevant_all + unknown, analysis["analyses"], analysis["relevance"]))
+            bot.send_document(chat_id, data, caption="📦 نتایج جدید، موارد نامشخص و آمار تکراری/قبلی")
+            csv_records = list(relevant_all) + list(unknown) + list(unanalyzed)
+            csv_analyses = dict(analysis["analyses"])
+            csv_relevance = dict(analysis["relevance"])
+            for i, skipped in enumerate(previous_skipped):
+                uid = f"history:{i}"
+                previous = skipped.get("previous_analysis") or {}
+                csv_records.append({"id": uid, "platform": skipped.get("platform"), "url": skipped.get("url", ""),
+                                    "post_key": skipped.get("post_key"), "record_status": "previously_processed",
+                                    "title": "قبلاً پردازش شده؛ تحلیل مجدد انجام نشد"})
+                csv_analyses[uid] = previous.get("analysis", "")
+                csv_relevance[uid] = skipped.get("previous_relevance")
+            table = io.BytesIO(scheduled_report.report_csv(csv_records, csv_analyses, csv_relevance, analysis.get("analysis_details", {})))
             table.name = f"trend_{schedule_id}_analysis.csv"
-            bot.send_document(chat_id, table, caption="📊 جدول نتایج مرتبط و نامشخص")
-        state = "OK" if records and not warnings else ("PARTIAL" if records else "EMPTY")
-        database.log_run(schedule_id, state, len(records), viral_winner.get("url", "") if viral_winner else "",
+            bot.send_document(chat_id, table, caption="📊 جدول نتایج جدید و موارد قبلاً پردازش‌شده")
+        state = "OK" if (new_records or previous_skipped) and not warnings else ("PARTIAL" if (new_records or previous_skipped) else "EMPTY")
+        database.log_run(schedule_id, state, len(new_records), viral_winner.get("url", "") if viral_winner else "",
                          "; ".join(warnings)[:1000], search_terms=terms)
     except Exception as exc:
         heartbeat_stop.set()
-        print(f"SCHEDULED JOB ERROR #{schedule_id}: {type(exc).__name__}: {exc}")
+        print(f"SCHEDULED JOB ERROR #{schedule_id}: {type(exc).__name__}")
         try:
             if status_msg:
-                bot.edit_message_text(f"❌ اجرای اسکژول #{schedule_id} ناموفق بود: {html.escape(str(exc)[:180] or type(exc).__name__)}", chat_id, status_msg.message_id)
+                bot.edit_message_text(f"❌ اجرای اسکژول #{schedule_id} ناموفق بود: {html.escape(type(exc).__name__)}", chat_id, status_msg.message_id)
             else:
                 bot.send_message(chat_id, f"❌ اجرای اسکژول #{schedule_id} ناموفق بود.")
         except Exception:
             pass
-        database.log_run(schedule_id, "FAILED", 0, "", str(exc)[:300], search_terms=terms)
+        database.log_run(schedule_id, "FAILED", 0, "", type(exc).__name__, search_terms=terms)
 
 
 # ============================================================

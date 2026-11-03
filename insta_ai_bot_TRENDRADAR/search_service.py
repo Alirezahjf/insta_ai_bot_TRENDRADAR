@@ -46,28 +46,30 @@ def generate_schedule_search_terms(schedule_id, seed_terms, *, max_keywords=5):
 
 
 def generate_topic_search_terms(schedule, max_keywords=5):
-    """Reserve new terms atomically across schedules of the same chat and topic."""
+    """Reserve new terms atomically and reuse only explicitly retryable terms."""
     topic = (schedule.get("topic") or "").strip()
     if not topic:
-        # Existing schedules retain their original subject as context, not fixed
-        # recurring hashtags. Import their previous history before generating.
         topic = "، ".join(schedule.get("hashtags") or [])
     if not topic:
         return [], [], "موضوع اسکژول مشخص نیست."
     key = database.topic_key(topic)
     chat_id = schedule["chat_id"]
+    platforms = ("instagram", "pinterest", "telegram")
     old = database.get_schedule_keyword_history(schedule["id"])
     old.extend(database.get_schedule_used_terms(schedule["id"]))
     database.reserve_topic_keywords(chat_id, key, _unique_terms(old))
     history = database.topic_history(chat_id, key)
     generated, error = ai_service.generate_topic_keywords(topic, excluded_terms=history, max_keywords=max_keywords)
-    fresh = database.reserve_topic_keywords(chat_id, key, _unique_terms(generated))
-    if not fresh:
-        return [], [], error or "عبارت تازه‌ای تولید نشد؛ برای جلوگیری از تکرار جست‌وجو اجرا نشد."
-    database.record_schedule_keywords(schedule["id"], fresh)
-    return fresh, fresh, error
+    fresh = database.reserve_topic_keywords(chat_id, key, _unique_terms(generated), platforms=platforms)
+    retryable = database.retryable_topic_terms(chat_id, key, platforms)
+    terms = _unique_terms(fresh + [t for t in retryable if t not in fresh])
+    if not terms:
+        return [], [], error or "عبارت تازه یا قابل تلاش مجدد وجود ندارد؛ جست‌وجوی تکراری انجام نشد."
+    if fresh:
+        database.record_schedule_keywords(schedule["id"], fresh)
+    return terms, fresh, error
 
-def scan_telegram_terms(terms, *, auto_join=False, progress=None):
+def scan_telegram_terms(terms, *, auto_join=False, progress=None, schedule_id=None):
     """همان کلیدواژه‌های جست‌وجوی Instagram را روی Telegram نیز اسکن می‌کند.
 
     شکست یا نبود پیکربندی Telegram ایزوله است و نباید مانع اجرای Apify شود.
@@ -105,26 +107,38 @@ def scan_telegram_terms(terms, *, auto_join=False, progress=None):
                 progress("در صف تلگرام؛ اجرای دیگری در حال انجام است")
             acquired = _telegram_scan_lock.acquire(timeout=min(5, remaining))
         try:
-            join_notes = []
-            if auto_join:
-                join_notes = radar._run_async(_discover_and_join(radar, hashtags, progress=progress))
+            consent_check = None
+            if schedule_id is not None:
+                def consent_check():
+                    current = database.get_schedule(schedule_id)
+                    return bool(current and not current.get("trashed") and current.get("telegram_auto_join"))
+            discovery = JoinDiscoveryResult()
+            try:
+                discovery = radar._run_async(_discover_and_join(
+                    radar, hashtags, progress=progress, auto_join=auto_join,
+                    consent_check=consent_check))
+            except Exception as exc:
+                discovery.notes.append(f"کشف/عضویت کانال ناموفق: {type(exc).__name__}؛ جست‌وجوی عمومی ادامه یافت.")
             if progress:
-                progress("جست‌وجوی هشتگ در تلگرام")
+                progress("جست‌وجوی هشتگ و fallback متنی در کانال‌های تلگرام")
             report = radar.scan(
-            hashtags=hashtags,
-            providers=["telegram"],
-            limit_per_tag=20,
-            window_hours=72,
-            auto_join=False,
-            joined_only=False,
-            discover_channels=False,
+                hashtags=hashtags,
+                providers=["telegram"],
+                limit_per_tag=20,
+                window_hours=72,
+                auto_join=False,
+                joined_only=False,
+                discover_channels=False,
+                target_channels=discovery.channels,
+                max_channels=max(20, min(100, len(discovery.channels) + 20)),
             )
-            report.errors.extend(join_notes)
+            report.errors.extend(discovery.notes)
+            report.provider_stats.setdefault("telegram", {}).update(discovery.stats)
             return report, ""
         finally:
             _telegram_scan_lock.release()
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"[:300]
+        return None, f"{type(exc).__name__}"[:300]
 
 
 _telegram_scan_lock = threading.Lock()
@@ -137,59 +151,146 @@ def _bounded_seconds(name, default, minimum, maximum):
         return default
 
 
-async def _discover_and_join(radar, hashtags, *, progress=None):
-    """Discover by plain text, then join up to 10 candidates per term under guards."""
-    from trendradar.errors import DailyCapReached, RateLimited
+class JoinDiscoveryResult:
+    def __init__(self):
+        self.notes = []
+        self.channels = []
+        self.stats = {"discovered": 0, "joined": 0, "deferred": 0, "pending_approval": 0}
+
+
+async def _discover_and_join(radar, hashtags, *, progress=None, auto_join=False,
+                             consent_check=None):
+    """Discover every run; join only with opt-in and under persistent guards.
+
+    Deferred candidates remain in TrendStorage and are reconsidered on later runs.
+    Discovery is bounded per term and per run; joins additionally obey the daily
+    cap, randomized interval, FloodWait/cooldown and the run time budget.
+    """
+    from trendradar.errors import DailyCapReached, RateLimited, GuardRejected
+    from search_identity import plain_search_text
     provider = radar.provider("telegram")
     await provider.connect()
-    seen, notes, joined = set(), [], 0
-    # Time budget prevents a single run from monopolizing the session for hours.
+    result = JoinDiscoveryResult()
+    notes, channels = result.notes, result.channels
+    per_term = _bounded_seconds("TG_DISCOVER_CHANNELS_PER_TERM", 10, 1, 20)
+    candidate_cap = _bounded_seconds("TG_JOIN_CANDIDATES_PER_RUN", 50, 1, 100)
     budget = _bounded_seconds("TG_JOIN_BUDGET_SECONDS", 300, 0, 7200)
     deadline = time.monotonic() + budget
-    stop = False
+    seen_uid, seen_username = set(), set()
+
+    def add(channel, term=None):
+        if channel.uid in seen_uid:
+            if term and channel.extra is not None:
+                terms = channel.extra.setdefault("scheduled_terms", [])
+                if term not in terms:
+                    terms.append(term)
+            return False
+        username = (getattr(channel, "username", None) or "").lower()
+        if username and username in seen_username:
+            return False
+        seen_uid.add(channel.uid)
+        if username:
+            seen_username.add(username)
+        if term:
+            if not hasattr(channel, "extra") or channel.extra is None:
+                channel.extra = {}
+            channel.extra.setdefault("scheduled_terms", []).append(term)
+        channels.append(channel)
+        return True
+
+    # Reconsider previously discovered, non-joined channels first (oldest first).
+    try:
+        pending = radar.storage.get_channels(provider="telegram", limit=200)
+        pending = sorted((c for c in pending if not c.joined), key=lambda c: c.discovered_at)
+        for channel in pending:
+            if len(channels) >= candidate_cap:
+                break
+            if not getattr(channel, "is_scam", False) and not getattr(channel, "is_fake", False) and not (getattr(channel, "extra", {}) or {}).get("forbidden"):
+                add(channel)
+    except Exception as exc:
+        notes.append(f"بارگذاری کانال‌های معوق: {type(exc).__name__}")
     for tag in hashtags:
         if progress:
-            progress(f"کشف کانال برای {tag}؛ {joined} عضویت انجام شده")
+            progress(f"کشف کانال برای {tag}")
         try:
-            channels = await provider.discover_channels(tag.replace("_", " "), limit=10, min_members=0)
+            found = await provider.discover_channels(plain_search_text(tag), limit=per_term, min_members=0)
         except (RateLimited, DailyCapReached) as exc:
             notes.append(f"توقف کشف کانال: {exc}")
             break
         except Exception as exc:
             notes.append(f"کشف کانال {tag}: {type(exc).__name__}")
             continue
-        for channel in channels[:10]:
-            if channel.uid in seen or channel.joined:
-                continue
-            seen.add(channel.uid)
-            try:
-                wait = provider.tg.join_guard.seconds_until_next_join
-                if time.monotonic() + wait > deadline:
-                    notes.append(f"بودجه زمانی عضویت ({budget} ثانیه) تمام شد؛ جست‌وجو ادامه یافت.")
-                    stop = True
-                    break
-                if wait > 0:
-                    if progress:
-                        progress(f"رعایت فاصله ایمن عضویت؛ {joined} عضویت انجام شده")
-                    await asyncio.sleep(wait + 0.1)
-                result = await provider.join_channel(channel)
-                radar.storage.upsert_channel(result)
-                if result.joined:
-                    joined += 1
-                else:
-                    notes.append(f"عضویت کانال {channel.title} تأیید نشد")
-            except (DailyCapReached, RateLimited) as exc:
-                notes.append(f"توقف عضویت برای ایمنی: {exc}")
-                stop = True
+        for channel in found[:per_term]:
+            if len(channels) >= candidate_cap:
+                notes.append(f"سقف کاندیدای کشف در اجرا ({candidate_cap}) پر شد؛ بقیه اجراهای بعد بررسی می‌شوند.")
                 break
-            except Exception as exc:
-                notes.append(f"عضویت {channel.title}: {type(exc).__name__}")
-            finally:
-                radar.storage.save_provider_state("telegram", provider.export_state())
+            if add(channel, tag):
+                result.stats["discovered"] += 1
+                try:
+                    radar.storage.upsert_channel(channel)
+                except Exception:
+                    notes.append("ذخیره کانال کشف‌شده ناموفق بود؛ عضویت معوق ممکن است حفظ نشود.")
+    if not auto_join:
+        notes.append("عضویت خودکار غیرفعال است؛ کشف کانال بدون عضویت انجام شد.")
+        return result
+    stop = False
+    for channel in channels[:candidate_cap]:
         if stop:
-            break
-    notes.append(f"عضویت خودکار: {joined} کانال در این اجرا؛ دسترسی و نتیجه تضمین نمی‌شود.")
-    return notes
+            result.stats["deferred"] += 1
+            continue
+        if channel.joined:
+            continue
+        if consent_check is not None and not consent_check():
+            notes.append("عضویت متوقف شد: رضایت جاری اسکژول غیرفعال است.")
+            stop = True
+            result.stats["deferred"] += 1
+            continue
+        if getattr(channel, "is_scam", False) or getattr(channel, "is_fake", False) or (getattr(channel, "extra", {}) or {}).get("forbidden"):
+            notes.append(f"عضویت {getattr(channel, 'title', '') or channel.uid} رد شد: کانال پرخطر یا غیرقابل‌دسترس.")
+            continue
+        try:
+            guard = provider.tg.join_guard
+            if guard.counter.remaining <= 0:
+                notes.append("سقف روزانه عضویت پر است؛ کانال‌های باقی‌مانده به اجرای بعد موکول شدند.")
+                stop = True
+                result.stats["deferred"] += 1
+                continue
+            wait = guard.seconds_until_next_join
+            if time.monotonic() + wait > deadline:
+                notes.append(f"بودجه زمانی عضویت ({budget} ثانیه) تمام شد؛ کانال‌های باقی‌مانده معوق ماندند.")
+                stop = True
+                result.stats["deferred"] += 1
+                continue
+            if wait > 0:
+                if progress:
+                    progress(f"رعایت فاصله ایمن عضویت؛ {result.stats['joined']} عضویت انجام شده")
+                await asyncio.sleep(wait + 0.1)
+            joined = await provider.join_channel(channel)
+            radar.storage.upsert_channel(joined)
+            if joined.joined:
+                result.stats["joined"] += 1
+            elif joined.extra.get("pending_approval"):
+                result.stats["pending_approval"] += 1
+                notes.append(f"درخواست عضویت {channel.title or channel.uid} ارسال شد؛ هنوز عضو نیست.")
+            else:
+                notes.append(f"عضویت {channel.title or channel.uid} تأیید نشد.")
+        except (DailyCapReached, RateLimited) as exc:
+            notes.append(f"توقف عضویت برای ایمنی: {exc}")
+            stop = True
+            result.stats["deferred"] += 1
+        except GuardRejected as exc:
+            notes.append(f"عضویت {channel.title or channel.uid} رد شد: {type(exc).__name__}")
+        except Exception as exc:
+            notes.append(f"عضویت {channel.title or channel.uid}: {type(exc).__name__}")
+        finally:
+            try:
+                radar.storage.save_provider_state("telegram", provider.export_state())
+            except Exception:
+                notes.append("ذخیره وضعیت گارد عضویت ناموفق بود.")
+    notes.append(f"عضویت خودکار: {result.stats['joined']} عضویت موفق، "
+                 f"{result.stats['pending_approval']} در انتظار تأیید، "
+                 f"{result.stats['deferred']} معوق؛ دسترسی و نتیجه تضمین نمی‌شود.")
+    return result
 
 
 async def _read_telegram_media(radar, item, *, max_bytes=45 * 1024 * 1024):

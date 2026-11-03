@@ -156,7 +156,7 @@ class ScheduledJobRoutingTests(unittest.TestCase):
         fake_bot = FakeBot()
         with patch.object(jobs, "bot", fake_bot), patch.object(
             jobs.database, "get_schedule", return_value=schedule
-        ), patch.object(jobs.database, "log_run") as log_run, patch.object(
+        ), patch.object(jobs.database, "log_run") as log_run, patch.object(jobs.database, "topic_terms_for_platform", side_effect=lambda c,k,p,t: t), patch.object(jobs.database, "reserve_post_records", side_effect=lambda c,k,r,run: (r, [])), patch.object(jobs.database, "complete_post_records"), patch.object(jobs.database, "record_keyword_platform_result"), patch.object(
             jobs.search_service, "generate_topic_search_terms",
             return_value=(terms, ["fresh_term"], None),
         ), patch.object(jobs.apify_service, "scrape_media", side_effect=[[], []]) as scrape, patch.object(
@@ -164,7 +164,7 @@ class ScheduledJobRoutingTests(unittest.TestCase):
         ) as telegram_scan, patch.object(
             jobs.pinterest_service, "scan_pinterest_terms", return_value=([{
                 "pin_id": "1", "title": "shirt", "score": 75, "pin_url": "https://pinterest.com/pin/1/"
-            }], [])
+            }], [], {"queries": [], "term_results": {}})
         ) as pinterest_scan:
             jobs.run_scheduled_job(7)
 
@@ -177,13 +177,14 @@ class ScheduledJobRoutingTests(unittest.TestCase):
         self.assertEqual(telegram_scan.call_args.args, (terms,))
         self.assertFalse(telegram_scan.call_args.kwargs["auto_join"])
         self.assertTrue(callable(telegram_scan.call_args.kwargs["progress"]))
-        pinterest_scan.assert_called_once_with(terms)
+        pinterest_scan.assert_called_once()
         self.assertEqual(log_run.call_args.kwargs["search_terms"], terms)
         self.assertEqual(len(fake_bot.documents), 2)
         payload = json.loads(fake_bot.documents[0][1])
         self.assertEqual(len(payload["records"]), 0)
         self.assertEqual(payload["excluded_count"], 0)
-        self.assertEqual(len(payload["unknown_records"]), 1)
+        self.assertEqual(len(payload["unknown_records"]), 0)
+        self.assertEqual(len(payload["unanalyzed_records"]), 1)
         self.assertEqual(len(payload["unified_ranking"]), 0)
         self.assertEqual(log_run.call_args.args[1], "PARTIAL")
 

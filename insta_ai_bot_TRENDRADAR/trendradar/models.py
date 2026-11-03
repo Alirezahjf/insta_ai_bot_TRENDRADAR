@@ -66,22 +66,9 @@ _AR_TO_FA = str.maketrans({
 
 
 def normalize_hashtag(raw: str) -> str:
-    """
-    نرمال‌سازی هشتگ — تا «#ترند» و «# ترند» و «#تُرند» یکی حساب شوند.
-
-    >>> normalize_hashtag(" #تُرند_مدلینگ ")
-    'ترند_مدلینگ'
-    """
-    if not raw:
-        return ""
-    tag = str(raw).strip().lstrip("#").strip()
-    tag = tag.translate(_AR_TO_FA)
-    tag = _DIACRITICS.sub("", tag)
-    tag = _ZWNJ.sub(" ", tag)
-    tag = " ".join(tag.split())          # چند فاصله → یک فاصله
-    tag = tag.replace(" ", "_")          # تلگرام فاصله را نمی‌پذیرد
-    tag = _NON_ALNUM.sub("", tag)
-    return tag.strip("_").lower()
+    """Canonical hashtag form shared with scheduled keyword reservations."""
+    from search_identity import normalize_search_keyword
+    return normalize_search_keyword(raw)
 
 
 # الگوی هشتگ در متن — حروف فارسی + لاتین + عدد + زیرخط
@@ -178,10 +165,10 @@ class Post:
     date: datetime
     text: str = ""
     hashtags: List[str] = field(default_factory=list)
-    views: int = 0
-    forwards: int = 0
-    replies: int = 0                     # تعداد کامنت/ریپلای
-    reactions: int = 0
+    views: Optional[int] = None
+    forwards: Optional[int] = None
+    replies: Optional[int] = None                     # تعداد کامنت/ریپلای
+    reactions: Optional[int] = None
     media_type: MediaType = MediaType.TEXT
     url: str = ""
     channel_title: str = ""
@@ -197,7 +184,7 @@ class Post:
     @property
     def engagement(self) -> int:
         """تعامل کل — معیار خام محبوبیت"""
-        return int(self.reactions) + int(self.forwards)
+        return int(self.reactions or 0) + int(self.forwards or 0)
 
     @property
     def engagement_rate(self) -> float:
@@ -329,6 +316,7 @@ class SearchQuery:
     languages: List[str] = field(default_factory=list)
     providers: List[str] = field(default_factory=list)   # خالی = همه
     exclude_channel_uids: List[str] = field(default_factory=list)
+    target_channels: List[ChannelRef] = field(default_factory=list)
 
     def normalized_hashtags(self) -> List[str]:
         seen: List[str] = []
@@ -341,6 +329,7 @@ class SearchQuery:
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["hashtags"] = self.normalized_hashtags()
+        d["target_channels"] = [c.uid for c in self.target_channels]
         return d
 
 
@@ -393,6 +382,7 @@ class RunReport:
     posts_collected: int = 0
     errors: List[str] = field(default_factory=list)
     provider_stats: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    term_results: Dict[str, str] = field(default_factory=dict)
 
     @property
     def duration_sec(self) -> float:
@@ -413,5 +403,6 @@ class RunReport:
             "posts": [p.to_dict() for p in self.posts],
             "provider_stats": self.provider_stats,
             "errors": self.errors,
+            "term_results": self.term_results,
             "signals": [s.to_dict() for s in self.signals],
         }

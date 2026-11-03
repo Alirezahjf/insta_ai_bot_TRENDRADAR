@@ -172,6 +172,8 @@ class TelegramProvider(MessengerProvider):
     # ═════════════════════════════════════════════════════════
     # جستجو
     # ═════════════════════════════════════════════════════════
+    handles_channel_fallback = True
+
     async def search_hashtag(
         self,
         tag: str,
@@ -180,65 +182,84 @@ class TelegramProvider(MessengerProvider):
         limit: int = 50,
         since: Optional[datetime] = None,
     ) -> List[Post]:
-        """
-        جستجوی هشتگ به‌صورت سراسری؛ به کشف کانال یا عضویت وابسته نیست.
+        """Public hashtag search plus per-channel hashtag→plain-text fallback.
 
-        اگر نتیجه کم باشد، مرحله‌ی تکمیلی تاریخ کانال‌های عضو در pipeline اجرا
-        می‌شود تا یک جستجو در چند لایه دوباره‌کاری نشود.
+        The fallback is executed in each targeted channel even when the public
+        search returned other posts. Channel and request counts are bounded;
+        Telegram rate/account errors stop the scan instead of becoming "empty".
         """
-        # The public-post hashtag API is distinct from global dialog search.
+        import os
+        from search_identity import plain_search_text
+        from ...models import normalize_hashtag
+        tag = normalize_hashtag(tag)
+        if not tag or limit <= 0:
+            return []
+        results: List[Post] = []
+
+        def extend(posts):
+            for post in posts or []:
+                if post.uid not in {p.uid for p in results}:
+                    results.append(post)
+
         public_search = getattr(self.search_ops, "search_public_hashtag", None)
         if callable(public_search):
             try:
-                public = await public_search(tag, limit=limit, since=since)
-                if public:
-                    return public
+                extend(await public_search(tag, limit=limit, since=since))
             except (RateLimited, DailyCapReached):
                 raise
             except Exception as exc:
                 self._search_warnings.append(f"جستجوی هشتگ عمومی #{tag}: {type(exc).__name__}")
-        try:
-            found = await self.search_ops.search_global(f"#{tag}", limit=limit, since=since)
-        except (RateLimited, DailyCapReached):
-            raise
-        except Exception as exc:
-            self._search_warnings.append(f"جستجوی #{tag}: {str(exc)[:120]}")
-            found = []
-        if found:
-            return found
-
-        # Fallback: discover public channels by words, then search their accessible
-        # history. Never join. A permission error is surfaced instead of faking zero.
-        query = tag.replace("_", " ")
-        try:
-            discovered = await self.discovery_ops.search_channels(query, limit=3, min_members=0)
-        except (RateLimited, DailyCapReached):
-            raise
-        except Exception as exc:
-            self._search_warnings.append(f"کشف کانال برای {tag}: {str(exc)[:120]}")
-            discovered = []
-        targets = []
-        for channel in list(discovered) + list(channels):
-            if channel.uid not in {c.uid for c in targets}:
-                targets.append(channel)
-        results = []
-        for channel in targets[:3]:
+        if not results:
             try:
-                # Text search handles both hashtagged and non-hashtagged content.
-                posts = await self.search_ops.search_in_chat_history(
-                    channel, query, limit=max(1, limit - len(results)), since=since)
-                for post in posts:
-                    # Record why a text result was matched, without pretending it
-                    # contained the exact hashtag in the original text.
-                    post.extra["matched_search_term"] = tag
-                results.extend(posts)
+                extend(await self.search_ops.search_global(f"#{tag}", limit=limit, since=since))
             except (RateLimited, DailyCapReached):
                 raise
             except Exception as exc:
-                self._search_warnings.append(f"کانال {channel.title or channel.uid}: {str(exc)[:120]}")
-            if len(results) >= limit:
-                break
-        return self.search_ops._dedupe(results)[:limit]
+                self._search_warnings.append(f"جستجوی سراسری #{tag}: {type(exc).__name__}")
+        targets, seen = [], set()
+        for channel in channels:
+            hinted = channel.extra.get("scheduled_terms") if channel.extra else None
+            if hinted and tag not in hinted and not channel.joined:
+                continue
+            if channel.uid in seen or channel.is_scam or channel.is_fake or channel.extra.get("forbidden"):
+                continue
+            seen.add(channel.uid)
+            targets.append(channel)
+        try:
+            cap = max(1, min(20, int(os.getenv("TG_FALLBACK_CHANNELS_PER_TERM", "10"))))
+        except ValueError:
+            cap = 10
+        if not targets and not results:
+            try:
+                discovered = await self.discovery_ops.search_channels(
+                    plain_search_text(tag), limit=cap, min_members=0)
+                targets = [c for c in discovered if c.uid not in seen][:cap]
+            except (RateLimited, DailyCapReached):
+                raise
+            except Exception as exc:
+                self._search_warnings.append(f"کشف کانال برای {tag}: {type(exc).__name__}")
+        fallback = getattr(self.search_ops, "search_hashtag_with_fallback", None)
+        for channel in targets[:cap]:
+            try:
+                if callable(fallback):
+                    posts = await fallback(channel, tag, limit=max(1, min(limit, 5)), since=since)
+                else:
+                    posts = await self.search_ops.search_in_chat_history(
+                        channel, plain_search_text(tag), limit=max(1, min(limit, 5)), since=since)
+                extend(posts)
+            except (RateLimited, DailyCapReached):
+                raise
+            except Exception as exc:
+                self._search_warnings.append(f"کانال {channel.title or channel.uid}: {type(exc).__name__}")
+        dedupe = getattr(self.search_ops, "_dedupe", None)
+        if callable(dedupe):
+            return dedupe(results)[:limit]
+        seen_uids, out = set(), []
+        for post in results:
+            if post.uid not in seen_uids:
+                seen_uids.add(post.uid)
+                out.append(post)
+        return out[:limit]
 
     def drain_warnings(self):
         warnings, self._search_warnings = self._search_warnings, []

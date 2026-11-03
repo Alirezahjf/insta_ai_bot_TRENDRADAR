@@ -183,6 +183,7 @@ class TrendRadar:
         discover_channels: bool = True,
         min_members: Optional[int] = None,
         max_channels: Optional[int] = None,
+        target_channels: Optional[Sequence[ChannelRef]] = None,
     ) -> RunReport:
         """
         اجرای یک اسکن ترند‌یابی (sync).
@@ -207,6 +208,7 @@ class TrendRadar:
             max_channels=max_channels or self.settings.max_channels_per_scan,
             exclude_channel_uids=list(self.settings.exclude_channels),
             providers=list(providers or self.settings.enabled_providers),
+            target_channels=list(target_channels or []),
         )
 
         targets = [p for p in query.providers if p in self._pipelines] or list(self._pipelines)
@@ -234,6 +236,7 @@ class TrendRadar:
             merged.channels_joined += rep.channels_joined
             merged.posts_collected += rep.posts_collected
             merged.provider_stats.update(rep.provider_stats)
+            merged.term_results.update(rep.term_results)
 
         # ادغام و رتبه‌بندی مجدد بین پیام‌رسان‌ها
         merged.signals = self._merge_signals(merged.signals)
