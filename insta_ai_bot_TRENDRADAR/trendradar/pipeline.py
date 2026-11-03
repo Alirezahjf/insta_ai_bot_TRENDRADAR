@@ -217,6 +217,8 @@ class TrendPipeline:
 
         for ch in joined:
             add(ch)
+        for ch in query.target_channels:
+            add(ch)
 
         # اگر فقط کانال‌های عضو را می‌خواهیم، همین‌جا تمام
         if query.joined_only:
@@ -391,17 +393,22 @@ class TrendPipeline:
                         tag, channels=channels, limit=query.limit_per_tag, since=since
                     )
                     extend(found)
+                    report.term_results[tag] = "succeeded"
                     log.info("  #%s → %d پست", tag, len(found))
                 except (RateLimited, DailyCapReached) as e:
                     report.errors.append(f"جستجوی #{tag} متوقف شد: {e}")
+                    report.term_results[tag] = "failed"
                     break
                 except Exception as e:
-                    report.errors.append(f"جستجوی #{tag} ناموفق: {type(e).__name__}: {e}")
+                    report.errors.append(f"جستجوی #{tag} ناموفق: {type(e).__name__}")
+                    report.term_results[tag] = "failed"
 
         # ── ب) جستجو در تاریخ کانال‌های عضو (اگر نتیجه کم بود) ──
         joined = [c for c in channels if c.joined]
         search_history = getattr(self.provider, "search_in_channels_history", None)
-        if joined and callable(search_history) and len(posts) < query.limit_per_tag * len(tags) // 2:
+        if (joined and callable(search_history)
+                and not getattr(self.provider, "handles_channel_fallback", False)
+                and len(posts) < query.limit_per_tag * len(tags) // 2):
             for tag in tags:
                 try:
                     found = await search_history(tag, joined[:10], limit=query.limit_per_tag // 2, since=since)

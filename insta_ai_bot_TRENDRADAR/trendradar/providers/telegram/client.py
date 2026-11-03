@@ -409,7 +409,8 @@ class TrendTelegramClient:
     # ── وضعیت ────────────────────────────────────────────
     def guards_state(self) -> dict:
         """وضعیت گاردها برای ذخیره‌سازی بین اجراها"""
-        state: dict = {"join": self.join_guard.to_state()}
+        state: dict = {"join": self.join_guard.to_state(),
+                       "search_rate": self.search_limiter.to_state()}
         if self.search_counter is not None:
             state["search"] = self.search_counter.to_state()
         return state
@@ -418,6 +419,8 @@ class TrendTelegramClient:
         try:
             if state.get("join"):
                 self.join_guard.from_state(state["join"])
+            if state.get("search_rate"):
+                self.search_limiter.from_state(state["search_rate"])
             if state.get("search") and self.search_counter is not None:
                 self.search_counter.from_state(state["search"])
         except Exception as e:

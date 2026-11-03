@@ -90,6 +90,21 @@ class RateLimiter:
         with self._lock:
             return max(0.0, self._blocked_until - time.monotonic())
 
+    def to_state(self) -> Dict[str, object]:
+        with self._lock:
+            now = time.monotonic()
+            return {"blocked_remaining": max(0.0, self._blocked_until - now),
+                    "next_remaining": max(0.0, self._next_allowed - now)}
+
+    def from_state(self, state: Dict[str, object]) -> None:
+        try:
+            now = time.monotonic()
+            with self._lock:
+                self._blocked_until = max(self._blocked_until, now + float(state.get("blocked_remaining", 0)))
+                self._next_allowed = max(self._next_allowed, now + float(state.get("next_remaining", 0)))
+        except (TypeError, ValueError):
+            pass
+
 
 # ─────────────────────────────────────────────────────────────
 # ۲) شمارنده‌ی روزانه
@@ -244,7 +259,8 @@ class JoinGuard:
     @property
     def seconds_until_next_join(self) -> float:
         with self._lock:
-            return max(0.0, self._next_allowed_at - time.monotonic())
+            return max(0.0, self._next_allowed_at - time.monotonic(),
+                       self._cooldown_until - time.monotonic())
 
     # ── ثبت نتیجه ────────────────────────────────────────
     def record_join(self, channel_uid: str = "") -> None:
@@ -302,7 +318,12 @@ class JoinGuard:
             }
 
     def to_state(self) -> Dict[str, object]:
-        return {"counter": self.counter.to_state(), "blacklist": sorted(self._blacklist)}
+        with self._lock:
+            now = time.monotonic()
+            return {"counter": self.counter.to_state(), "blacklist": sorted(self._blacklist),
+                    "next_remaining": max(0.0, self._next_allowed_at - now),
+                    "cooldown_remaining": max(0.0, self._cooldown_until - now),
+                    "joined_today": sorted(self._joined_today)}
 
     def from_state(self, state: Dict[str, object]) -> None:
         try:
@@ -310,5 +331,12 @@ class JoinGuard:
             bl = state.get("blacklist") or []
             if isinstance(bl, (list, tuple, set)):
                 self._blacklist = {str(x) for x in bl}
+            with self._lock:
+                now = time.monotonic()
+                self._next_allowed_at = max(self._next_allowed_at, now + float(state.get("next_remaining", 0)))
+                self._cooldown_until = max(self._cooldown_until, now + float(state.get("cooldown_remaining", 0)))
+                joined = state.get("joined_today") or []
+                if isinstance(joined, (list, tuple, set)):
+                    self._joined_today.update(str(x) for x in joined)
         except Exception:
             pass

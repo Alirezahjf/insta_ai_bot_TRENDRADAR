@@ -81,12 +81,12 @@ class TelegramMediaTests(unittest.TestCase):
             return {'analyses': {records[0]['id']: 'ادعای بی‌پایه'}, 'relevance': {records[0]['id']: True},
                     'best_id': records[0]['id'], 'summary': '', 'analyzed': 1, 'errors': []}
         with patch.object(jobs, 'bot', bot), patch.object(jobs.database, 'get_schedule', return_value=sched), \
-             patch.object(jobs.database, 'log_run'), \
+             patch.object(jobs.database, 'log_run'), patch.object(jobs.database, 'topic_terms_for_platform', side_effect=lambda c,k,p,t: t), patch.object(jobs.database, 'reserve_post_records', side_effect=lambda c,k,r,run: (r, [])), patch.object(jobs.database, 'complete_post_records'), patch.object(jobs.database, 'record_keyword_platform_result'), \
              patch.object(jobs.search_service, 'generate_topic_search_terms', return_value=(['fashion'], [], None)), \
              patch.object(jobs.search_service, 'scan_telegram_terms', return_value=(report, '')), \
              patch.object(jobs.search_service, 'fetch_telegram_media', return_value=(b'video bytes', '')), \
              patch.object(jobs.apify_service, 'scrape_media', return_value=[]), \
-             patch.object(jobs.pinterest_service, 'scan_pinterest_terms', return_value=([], [])), \
+             patch.object(jobs.pinterest_service, 'scan_pinterest_terms', return_value=([], [], {"queries": [], "term_results": {}})), \
              patch.object(jobs.scheduled_report, 'analyze_all', side_effect=analyze):
             jobs.run_scheduled_job(5)
         self.assertEqual(len(bot.sent), 1)
@@ -115,12 +115,12 @@ class TelegramMediaTests(unittest.TestCase):
             return {'analyses': {records[0]['id']: 'مرتبط'}, 'relevance': {records[0]['id']: True},
                     'best_id': records[0]['id'], 'summary': '', 'analyzed': 1, 'errors': []}
         with patch.object(jobs, 'bot', bot), patch.object(jobs.database, 'get_schedule', return_value=sched), \
-             patch.object(jobs.database, 'log_run'), \
+             patch.object(jobs.database, 'log_run'), patch.object(jobs.database, 'topic_terms_for_platform', side_effect=lambda c,k,p,t: t), patch.object(jobs.database, 'reserve_post_records', side_effect=lambda c,k,r,run: (r, [])), patch.object(jobs.database, 'complete_post_records'), patch.object(jobs.database, 'record_keyword_platform_result'), \
              patch.object(jobs.search_service, 'generate_topic_search_terms', return_value=(['fashion'], [], None)), \
              patch.object(jobs.search_service, 'scan_telegram_terms', return_value=(report, '')), \
              patch.object(jobs.search_service, 'fetch_telegram_media', return_value=(b'image bytes', '')), \
              patch.object(jobs.apify_service, 'scrape_media', return_value=[]), \
-             patch.object(jobs.pinterest_service, 'scan_pinterest_terms', return_value=([], [])), \
+             patch.object(jobs.pinterest_service, 'scan_pinterest_terms', return_value=([], [], {"queries": [], "term_results": {}})), \
              patch.object(jobs.scheduled_report, 'analyze_all', side_effect=analyze):
             jobs.run_scheduled_job(5)
         self.assertEqual(bot.sent[0][0], b'image bytes')

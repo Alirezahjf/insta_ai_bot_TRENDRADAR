@@ -78,24 +78,29 @@ class JoinBudgetTests(unittest.TestCase):
         import asyncio
         calls = []
         class Provider:
-            tg = SimpleNamespace(join_guard=SimpleNamespace(seconds_until_next_join=60))
+            tg = SimpleNamespace(join_guard=SimpleNamespace(seconds_until_next_join=60, counter=SimpleNamespace(remaining=1)))
             async def connect(self): pass
             async def discover_channels(self, query, **kwargs):
                 return [SimpleNamespace(uid="1", joined=False, title="test")]
             async def join_channel(self, channel): calls.append(channel)
             def export_state(self): return {}
-        radar = SimpleNamespace(provider=lambda name: Provider(), storage=SimpleNamespace(save_provider_state=lambda *a: None))
+        radar = SimpleNamespace(provider=lambda name: Provider(), storage=SimpleNamespace(save_provider_state=lambda *a: None, get_channels=lambda **kw: []))
         with patch.dict('os.environ', {'TG_JOIN_BUDGET_SECONDS': '1'}):
-            notes = asyncio.run(search_service._discover_and_join(radar, ['test']))
+            result = asyncio.run(search_service._discover_and_join(radar, ['test'], auto_join=True))
+        notes = result.notes
         self.assertFalse(calls)
         self.assertTrue(any('بودجه زمانی' in note for note in notes))
+
+async def _async_result(value):
+    return value
+
 
 class TelegramQueueSuccessTests(unittest.TestCase):
     def test_queued_scan_proceeds_after_previous_run_releases_lock(self):
         lock = threading.Lock()
         lock.acquire()
-        returned = SimpleNamespace(errors=[])
-        radar = SimpleNamespace(scan=lambda **kwargs: returned)
+        returned = SimpleNamespace(errors=[], provider_stats={}, term_results={})
+        radar = SimpleNamespace(scan=lambda **kwargs: returned, _run_async=lambda value: value, provider=lambda name: SimpleNamespace())
         settings = SimpleNamespace(telegram=SimpleNamespace(configured=True), enabled_providers=[])
         timer = threading.Timer(0.1, lock.release)
         progress = []
@@ -103,6 +108,7 @@ class TelegramQueueSuccessTests(unittest.TestCase):
         try:
             with patch.object(search_service, '_telegram_scan_lock', lock), patch.object(search_service, '_radar', radar), \
                  patch('trendradar.config.load_settings', return_value=settings), \
+                 patch.object(search_service, '_discover_and_join', new=lambda *a, **k: search_service.JoinDiscoveryResult()), \
                  patch.dict('os.environ', {'TG_SCAN_QUEUE_TIMEOUT': '2'}):
                 report, error = search_service.scan_telegram_terms(['test'], progress=progress.append)
         finally:

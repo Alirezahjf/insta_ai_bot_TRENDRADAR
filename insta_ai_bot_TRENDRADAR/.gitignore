@@ -16,3 +16,10 @@ trend_report_*.json
 
 # pinscrape local runtime state
 data/time_epoch.json
+
+# Local virtual environments and Telegram session sidecars
+.venv/
+*.session-*
+*.db-journal
+*.db-wal
+*.db-shm

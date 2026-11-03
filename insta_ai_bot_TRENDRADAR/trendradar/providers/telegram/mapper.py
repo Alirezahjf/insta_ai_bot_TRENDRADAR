@@ -51,6 +51,17 @@ def _safe_int(v: Any) -> int:
         return 0
 
 
+def _optional_count(v: Any):
+    """Missing counters stay unknown; an explicit zero remains zero."""
+    if v is None:
+        return None
+    try:
+        value = int(v)
+        return value if value >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _count_reactions(msg: Any) -> int:
     """
     جمع تعداد ری‌اکشن‌ها.
@@ -63,6 +74,8 @@ def _count_reactions(msg: Any) -> int:
     هر ReactionCount یک فیلد `count` دارد → جمعشان می‌کنیم.
     """
     r = getattr(msg, "reactions", None)
+    if r is None:
+        return None
     if not r:
         return 0
     total = 0
@@ -78,9 +91,9 @@ def _count_replies(msg: Any) -> int:
     ساختار Message.replies (از سورس): MessageReplies(replies, comments, ...)
     """
     r = getattr(msg, "replies", None)
-    if not r:
-        return 0
-    return _safe_int(getattr(r, "replies", 0))
+    if r is None:
+        return None
+    return _optional_count(getattr(r, "replies", None))
 
 
 def detect_media_type(msg: Any) -> MediaType:
@@ -282,8 +295,8 @@ def message_to_post(
         date=_to_aware(getattr(msg, "date", None)),
         text=text[:4000],
         hashtags=extract_hashtags(text),
-        views=_safe_int(getattr(msg, "views", 0)) if has_views else 0,
-        forwards=_safe_int(getattr(msg, "forwards", 0)),
+        views=_optional_count(getattr(msg, "views", None)) if has_views else None,
+        forwards=_optional_count(getattr(msg, "forwards", None)),
         replies=_count_replies(msg),
         reactions=_count_reactions(msg),
         media_type=detect_media_type(msg),
@@ -318,8 +331,8 @@ def messages_to_posts(
             continue
         if skip_forwards and p.is_forwarded:
             continue                       # پست فورواردشده ترند اصلی نیست
-        if not p.hashtags and not p.text.strip():
-            continue                       # رسانه بدون متن — سیگنال متنی ندارد
+        if not p.hashtags and not p.text.strip() and p.media_type not in (MediaType.PHOTO, MediaType.VIDEO):
+            continue                       # متن/رسانه قابل بررسی ندارد
 
         # آلبوم (چند عکس با یک grouped_id) → فقط اولین را نگه دار
         gid = p.extra.get("grouped_id")
