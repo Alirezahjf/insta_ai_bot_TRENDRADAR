@@ -295,6 +295,7 @@ def message_to_post(
         extra={
             "post": bool(getattr(msg, "post", False)),
             "grouped_id": getattr(msg, "grouped_id", None),
+            "peer_type": type(getattr(msg, "peer_id", None)).__name__,
         },
     )
 

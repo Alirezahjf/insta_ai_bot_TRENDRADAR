@@ -1,0 +1,18 @@
+# Local secrets and Telegram sessions
+.env
+*.session
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Local databases and logs
+*.db
+*.sqlite3
+bot.log
+
+# Generated TrendRadar reports
+trend_report_*.json
+
+# pinscrape local runtime state
+data/time_epoch.json

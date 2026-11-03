@@ -68,15 +68,19 @@ class TrendRadar:
     # راه‌اندازی
     # ═════════════════════════════════════════════════════════
     def _setup_logging(self) -> None:
-        if not logging.getLogger("trendradar").handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(
-                logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)-12s | %(message)s",
-                                  datefmt="%H:%M:%S")
-            )
-            lg = logging.getLogger("trendradar")
-            lg.addHandler(handler)
-            lg.setLevel(getattr(logging, self.settings.log_level.upper(), logging.INFO))
+        lg = logging.getLogger("trendradar")
+        lg.setLevel(getattr(logging, self.settings.log_level.upper(), logging.INFO))
+        if lg.handlers:
+            return
+        # The bot configures root handlers (journal and bot.log); installing a
+        # second handler here duplicated every line. CLI still gets a handler.
+        if logging.getLogger().handlers:
+            return
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)-7s | %(name)-12s | %(message)s", datefmt="%H:%M:%S"))
+        lg.addHandler(handler)
+        lg.propagate = False
 
     def register_default_providers(self) -> List[str]:
         """ثبت پرووایدرهای داخلی (تلگرام و هر چه بعداً اضافه شود)"""
@@ -223,6 +227,7 @@ class TrendRadar:
                 continue
 
             merged.signals.extend(rep.signals)
+            merged.posts.extend(rep.posts)
             merged.errors.extend(rep.errors)
             merged.channels_scanned += rep.channels_scanned
             merged.channels_discovered += rep.channels_discovered

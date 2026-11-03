@@ -106,8 +106,7 @@ class TelegramDiscovery:
         except RateLimited:
             raise
         except Exception as e:
-            log.debug("contacts.Search «%s» ناموفق: %s", query, e)
-            return []
+            raise RuntimeError(f"کشف کانال تلگرام: {type(e).__name__}") from e
 
         out: List[ChannelRef] = []
         for ch in getattr(result, "chats", None) or []:

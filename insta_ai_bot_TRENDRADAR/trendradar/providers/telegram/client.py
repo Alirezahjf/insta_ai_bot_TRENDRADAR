@@ -315,6 +315,7 @@ class TrendTelegramClient:
         req: Any,
         *,
         rate_limit: bool = True,
+        translate_rpc: bool = True,
         retries: int = 2,
         retry_delay: float = 2.0,
     ) -> Any:
@@ -326,11 +327,6 @@ class TrendTelegramClient:
         """
         _TelegramClient, errors, _f, _t = _import_telethon()
 
-        if rate_limit:
-            self.search_limiter.wait()
-            if self.search_counter is not None:
-                self.search_counter.check("جستجو در تلگرام")
-
         client = await self.ensure_client()
         if not client.is_connected():
             await self.connect()
@@ -338,6 +334,12 @@ class TrendTelegramClient:
         attempt = 0
         while True:
             attempt += 1
+            if rate_limit:
+                await self.search_limiter.wait_async()
+                if self.search_counter is not None:
+                    # شمارش هر تلاش API (از جمله retry) برای اعمال واقعی سقف روزانه.
+                    self.search_counter.check("جستجو در تلگرام")
+                    self.search_counter.bump()
             try:
                 return await client(req)
             except errors.FloodWaitError as e:
@@ -365,6 +367,8 @@ class TrendTelegramClient:
                     log.debug("خطای گذرا (تلاش %d/%d): %s", attempt, retries, e)
                     await asyncio.sleep(retry_delay * attempt)
                     continue
+                if not translate_rpc:
+                    raise
                 raise self._translate(e) from e
             except (ConnectionError, OSError) as e:
                 if attempt <= retries:

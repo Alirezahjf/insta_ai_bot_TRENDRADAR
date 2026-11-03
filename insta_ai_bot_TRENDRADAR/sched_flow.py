@@ -1,5 +1,6 @@
 """فلو اسکژول اسکرپ هوشمند: ساخت + لیست + ویرایش + سطل آشغال"""
 import threading
+import html
 
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -19,7 +20,7 @@ def sched_card(s):
     cm = f"✅ ({s['top_n']} پست × {s['comments_per']})" if s["want_comments"] else "❌"
     return (f"{status} <b>اسکژول #{s['id']}</b>\n"
             f"🕐 ساعت‌ها (تهران): <b>{times}</b>\n"
-            f"🏷️ هشتگ‌ها: {tags}\n"
+            f"🎯 موضوع: {html.escape(s.get('topic') or tags)}\n"
             f"🔢 تعداد: {s['count_per_hashtag']} | 📦 {TYPE_NAMES.get(s['content_type'], s['content_type'])} | "
             f"💬 کامنت: {cm}")
 
@@ -50,7 +51,7 @@ def render_hub(chat_id, message_id):
     for s in scheds:
         emoji = "🟢" if s["enabled"] else "🔴"
         times = ",".join(s["times"]) if s["times"] else "—"
-        lines.append(f"{emoji} <b>#{s['id']}</b> 🕐 {times} | {'، '.join('#' + t for t in s['hashtags'][:3])}")
+        lines.append(f"{emoji} <b>#{s['id']}</b> 🕐 {times} | {html.escape(s.get('topic') or '، '.join('#' + t for t in s['hashtags'][:3]))}")
         kb.add(InlineKeyboardButton(f"⚙️ #{s['id']} | 🕐 {times}", callback_data=f"sch_detail_{s['id']}"))
     kb.add(InlineKeyboardButton("➕ اسکژول جدید", callback_data="sch_new"))
     if trash_n:
@@ -79,10 +80,11 @@ def show_detail(chat_id, message_id, sid):
 def show_edit_menu(chat_id, message_id, sid):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("🕐 ساعت‌ها", callback_data=f"sche_times_{sid}"),
-           InlineKeyboardButton("🏷️ هشتگ‌ها", callback_data=f"sche_tags_{sid}"))
+           InlineKeyboardButton("🎯 موضوع", callback_data=f"sche_tags_{sid}"))
     kb.add(InlineKeyboardButton("🔢 تعداد", callback_data=f"sche_count_{sid}"),
            InlineKeyboardButton("📦 نوع محتوا", callback_data=f"sche_type_{sid}"))
     kb.add(InlineKeyboardButton("💬 تنظیمات کامنت", callback_data=f"sche_cm_{sid}"))
+    kb.add(InlineKeyboardButton("📡 تنظیم عضویت تلگرام", callback_data=f"sche_join_{sid}"))
     kb.add(InlineKeyboardButton("🔙 برگشت", callback_data=f"sch_detail_{sid}"))
     bot.edit_message_text(f"✏️ <b>ویرایش اسکژول #{sid}</b>\n\nکدوم بخش رو عوض کنم؟",
                           chat_id, message_id, reply_markup=kb)
@@ -99,7 +101,7 @@ def show_trash(chat_id, message_id):
     lines = [f"🗑️ <b>سطل آشغال</b> ({len(items)} تا)\n"]
     for s in items:
         times = ",".join(s["times"]) if s["times"] else "—"
-        lines.append(f"• <b>#{s['id']}</b> 🕐 {times} | {'، '.join('#' + t for t in s['hashtags'][:3])}")
+        lines.append(f"• <b>#{s['id']}</b> 🕐 {times} | {html.escape(s.get('topic') or '، '.join('#' + t for t in s['hashtags'][:3]))}")
         kb.add(InlineKeyboardButton(f"↩️ برگردون #{s['id']}", callback_data=f"sch_restore_{s['id']}"),
                InlineKeyboardButton(f"❌ حذف کامل #{s['id']}", callback_data=f"sch_purge_{s['id']}"))
     kb.add(InlineKeyboardButton("🧹 خالی کردن کامل سطل", callback_data="sch_purgeall"))
@@ -108,48 +110,44 @@ def show_trash(chat_id, message_id):
 
 
 # ---------- ساخت اسکژول جدید ----------
+def _ask_times(chat_id, u):
+    u["state"] = "S_TIMES"
+    bot.send_message(chat_id, "⏰ ساعت‌های اجرا به وقت تهران را با کاما بفرستید؛ مثال: <code>08:00, 20:00</code> (حداکثر ۸ ساعت)", reply_markup=cancel_keyboard())
+
+
 def start_creation(chat_id, first=False):
     u = get_user(chat_id)
     u.clear()
-    u.update({"flow": "sched", "state": "S_TIMES"})
-    pre = "👋 هنوز اسکژولی نداری، بذار باهم بسازیم!\n\n" if first else ""
-    bot.send_message(chat_id,
-        f"{pre}⏰ <b>ساخت اسکژول — قدم ۱ از ۶: ساعت‌ها</b>\n\n"
-        "توی طول روز چه ساعت‌هایی (به <b>وقت تهران</b>) اسکرپ انجام بشه؟\n"
-        "با کاما جدا کن. مثال:\n<code>08:00, 12:30, 20:00</code>\n\n⚠️ حداکثر ۸ ساعت",
-        reply_markup=cancel_keyboard())
+    u.update({"flow": "sched", "state": "S_TOPIC"})
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("👕 پوشاک کژوال و مدلینگ", callback_data="topic_fashion"))
+    kb.add(InlineKeyboardButton("💻 فناوری و برنامه‌نویسی", callback_data="topic_technology"),
+           InlineKeyboardButton("✈️ سفر و گردشگری", callback_data="topic_travel"))
+    kb.add(InlineKeyboardButton("✍️ موضوع دلخواه", callback_data="topic_custom"))
+    bot.send_message(chat_id, "🎯 <b>موضوع اسکژول را انتخاب کنید</b>؛ برای موضوع دقیق‌تر از گزینهٔ دلخواه استفاده کنید.", reply_markup=kb)
 
 
 def on_text(message, u) -> bool:
     chat_id, state, txt = message.chat.id, u.get("state"), message.text or ""
 
     # ----- ساخت -----
+    if state == "S_TOPIC_CUSTOM":
+        topic = " ".join(txt.split())
+        if not 3 <= len(topic) <= 180:
+            bot.send_message(chat_id, "⚠️ موضوع را بین ۳ تا ۱۸۰ نویسه بنویسید.")
+            return True
+        u["topic"] = topic
+        _ask_times(chat_id, u)
+        return True
+
     if state == "S_TIMES":
         times, err = parse_times(txt)
         if err:
             bot.send_message(chat_id, f"⚠️ {err}")
             return True
         u["times"] = times
-        u["state"] = "S_HASHTAGS"
-        bot.send_message(chat_id,
-            f"✅ ساعت‌ها: <b>{'، '.join(times)}</b> (تهران)\n\n"
-            f"🏷️ <b>قدم ۲ از ۶: هشتگ‌ها</b>\nبفرست (مثال: <code>travel, food</code>) — حداکثر ۵ تا",
-            reply_markup=cancel_keyboard())
-        return True
-
-    if state == "S_HASHTAGS":
-        tags = parse_hashtags(txt)
-        if not tags:
-            bot.send_message(chat_id, "⚠️ هشتگ معتبر پیدا نکردم!")
-            return True
-        if len(tags) > 5:
-            tags = tags[:5]
-        u["hashtags"] = tags
         u["state"] = "S_COUNT"
-        bot.send_message(chat_id,
-            f"✅ هشتگ‌ها: <b>{'، '.join('#' + t for t in tags)}</b>\n\n"
-            f"🔢 <b>قدم ۳ از ۶: تعداد</b>\nبه ازای هر هشتگ چند نتیجه؟ (۱ تا ۲۰۰)\nدکمه بزن یا تایپ کن 👇",
-            reply_markup=count_keyboard())
+        bot.send_message(chat_id, "🔢 برای هر عبارت جست‌وجو چند نتیجه؟ (۱ تا ۲۰۰)", reply_markup=count_keyboard())
         return True
 
     if state == "S_COUNT":
@@ -181,7 +179,7 @@ def on_text(message, u) -> bool:
             bot.send_message(chat_id, "⚠️ عدد بین ۱ تا ۵۰!")
             return True
         u["comments_per"] = n
-        _show_sched_confirm(chat_id)
+        _ask_join_permission(chat_id)
         return True
 
     # ----- ویرایش -----
@@ -198,13 +196,13 @@ def on_text(message, u) -> bool:
                          reply_markup=main_menu())
         return True
 
-    if state == "E_HASHTAGS":
-        tags = parse_hashtags(txt)
-        if not tags:
-            bot.send_message(chat_id, "⚠️ هشتگ معتبر پیدا نکردم!")
+    if state == "E_TOPIC":
+        topic = " ".join(txt.split())
+        if not 3 <= len(topic) <= 180:
+            bot.send_message(chat_id, "⚠️ موضوع باید ۳ تا ۱۸۰ نویسه باشد.")
             return True
-        database.update_schedule(sid, {"hashtags": tags[:5]})
-        bot.send_message(chat_id, "✅ هشتگ‌ها آپدیت شد.", reply_markup=main_menu())
+        database.update_schedule(sid, {"topic": topic})
+        bot.send_message(chat_id, "✅ موضوع اسکژول تغییر کرد.", reply_markup=main_menu())
         return True
 
     if state == "E_COUNT":
@@ -240,13 +238,23 @@ def on_text(message, u) -> bool:
     return False
 
 
+def _ask_join_permission(chat_id):
+    u = get_user(chat_id)
+    u["state"] = "S_JOIN_ASK"
+    bot.send_message(chat_id,
+        "📡 آیا اجازه می‌دهید حساب تلگرام در کانال‌های عمومی مرتبط عضو شود؟ "
+        "عضویت واقعی و ماندگار است و ممکن است محدودیت حساب ایجاد کند. "
+        "برای هر عبارت حداکثر ۱۰ کانال بررسی می‌شود. سقف روزانه و فاصلهٔ ایمنی ممکن است کار را ساعت‌ها طول دهد؛ دسترسی و نتیجه تضمین نمی‌شود.",
+        reply_markup=yes_no_inline("schjoin_yes", "schjoin_no", "✅ اجازه می‌دهم", "❌ بدون عضویت"))
+
+
 def _show_sched_confirm(chat_id):
     u = get_user(chat_id)
     u["state"] = "S_CONFIRM"
     tags, count = u.get("hashtags", []), u.get("count", 0)
     times = u.get("times", [])
     n_types = 2 if u.get("content_type") == "both" else 1
-    n_posts = len(tags) * count * n_types
+    n_posts = 5 * count * n_types
     if u.get("want_comments"):
         n_cm = u.get("top_n", 5) * u.get("comments_per", 10)
         cm_line = f"💬 کامنت: ✅ ({u.get('top_n')} پست × {u.get('comments_per')} = {n_cm})"
@@ -259,16 +267,36 @@ def _show_sched_confirm(chat_id):
     bot.send_message(chat_id,
         "🧾 <b>قدم ۶ از ۶: تأیید اسکژول</b>\n\n"
         f"🕐 ساعت‌ها (تهران): <b>{'، '.join(times)}</b>\n"
-        f"🏷️ هشتگ‌ها: <b>{'، '.join('#' + t for t in tags)}</b>\n"
+        f"🎯 موضوع: <b>{html.escape(u.get('topic', ''))}</b>\n"
+        f"📡 عضویت خودکار Telegram: {'بله (با گارد)' if u.get('telegram_auto_join') else 'خیر'}\n"
         f"🔢 تعداد: <b>{count}</b> | 📦 <b>{TYPE_NAMES.get(u.get('content_type'))}</b>\n"
         f"{cm_line}\n"
-        f"🤖 تحلیل AI: ✅ (انتخاب تک‌پست برتر + راهنما)\n\n"
-        f"💰 هزینه هر اجرا: حدود <b>${per_run:.2f}</b> | روزی {len(times)} اجرا\n\nذخیره کنم؟",
+        f"🤖 تحلیل AI: ✅ (ارتباط و انتخاب نتایج)\n\n"
+        f"💰 تخمین پایه: حدود <b>${per_run:.2f}</b> | روزی {len(times)} اجرا\n"
+        "⚠️ حداکثر ۵ عبارت تازه با AI تولید می‌شود؛ هزینهٔ واقعی جست‌وجو و تحلیل همهٔ نتایج ممکن است بیشتر باشد.\n\nذخیره کنم؟",
         reply_markup=kb)
 
 
 def on_callback(call, u) -> bool:
     chat_id, mid, data = call.message.chat.id, call.message.message_id, call.data
+
+    if data.startswith("topic_") and u.get("state") == "S_TOPIC":
+        choice = data.removeprefix("topic_")
+        choices = {"fashion": "پوشاک کژوال مردانه، استایل و مدلینگ ایران و ترکیه", "technology": "فناوری و برنامه‌نویسی", "travel": "سفر و گردشگری"}
+        if choice == "custom":
+            u["state"] = "S_TOPIC_CUSTOM"
+            bot.edit_message_text("✍️ موضوع دقیق را بنویسید:", chat_id, mid)
+        elif choice in choices:
+            u["topic"] = choices[choice]
+            bot.edit_message_text(f"✅ موضوع: {html.escape(u['topic'])}", chat_id, mid)
+            _ask_times(chat_id, u)
+        return True
+
+    if data in ("schjoin_yes", "schjoin_no") and u.get("state") == "S_JOIN_ASK":
+        u["telegram_auto_join"] = data == "schjoin_yes"
+        bot.edit_message_text("✅ تنظیم عضویت ثبت شد.", chat_id, mid)
+        _show_sched_confirm(chat_id)
+        return True
 
     # ----- ساخت: نوع/کامنت/تعداد -----
     if data.startswith("stype_"):
@@ -283,7 +311,7 @@ def on_callback(call, u) -> bool:
 
     if data == "scm_no":
         u["want_comments"] = False
-        _show_sched_confirm(chat_id)
+        _ask_join_permission(chat_id)
         return True
 
     if data == "scm_yes":
@@ -304,7 +332,7 @@ def on_callback(call, u) -> bool:
 
     if data.startswith("scpc_"):
         u["comments_per"] = int(data.replace("scpc_", ""))
-        _show_sched_confirm(chat_id)
+        _ask_join_permission(chat_id)
         return True
 
     if data == "schc_cancel":
@@ -316,7 +344,7 @@ def on_callback(call, u) -> bool:
     if data == "schc_start":
         sid = database.create_schedule({
             "chat_id": chat_id, "times": u.get("times", []),
-            "hashtags": u.get("hashtags", []), "count_per_hashtag": u.get("count", 20),
+            "hashtags": [], "topic": u.get("topic", ""), "telegram_auto_join": u.get("telegram_auto_join", False), "count_per_hashtag": u.get("count", 20),
             "content_type": u.get("content_type", "both"),
             "want_comments": u.get("want_comments", False),
             "top_n": u.get("top_n", 5), "comments_per": u.get("comments_per", 10),
@@ -428,8 +456,23 @@ def on_callback(call, u) -> bool:
     if data.startswith("sche_tags_"):
         sid = int(data.replace("sche_tags_", ""))
         u["edit"] = {"id": sid}
-        u["state"] = "E_HASHTAGS"
-        bot.edit_message_text(f"🏷️ هشتگ‌های جدید اسکژول #{sid} رو بفرست:", chat_id, mid)
+        u["state"] = "E_TOPIC"
+        bot.edit_message_text(f"🎯 موضوع جدید اسکژول #{sid} رو بفرست:", chat_id, mid)
+        return True
+
+    if data.startswith("sche_join_choice_"):
+        _, _, _, sid, choice = data.split("_")
+        database.update_schedule(int(sid), {"telegram_auto_join": choice == "yes"})
+        bot.answer_callback_query(call.id, "✅ ذخیره شد")
+        show_detail(chat_id, mid, int(sid))
+        return True
+
+    if data.startswith("sche_join_"):
+        sid = int(data.replace("sche_join_", ""))
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✅ اجازه عضویت", callback_data=f"sche_join_choice_{sid}_yes"),
+               InlineKeyboardButton("❌ بدون عضویت", callback_data=f"sche_join_choice_{sid}_no"))
+        bot.edit_message_text("عضویت خودکار واقعی و ماندگار است و می‌تواند باعث محدودیت حساب شود. اجازه می‌دهید؟", chat_id, mid, reply_markup=kb)
         return True
 
     if data.startswith("sche_count_"):

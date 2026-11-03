@@ -90,7 +90,10 @@ class TelegramMembership:
             updates = await self.tg.request(
                 functions.channels.JoinChannelRequest(channel=entity),
                 rate_limit=False,        # گارد عضویت خودش نرخ را کنترل می‌کند
+                translate_rpc=False,     # membership handles specific RPC errors
             )
+        except (RateLimited, DailyCapReached):
+            raise
         except _errors.UserAlreadyParticipantError:
             log.info("قبلاً عضو «%s» بودیم", channel.title)
             guard.record_join(channel.uid)
