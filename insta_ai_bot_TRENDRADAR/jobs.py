@@ -414,8 +414,12 @@ def run_scheduled_job(schedule_id):
             progress=lambda i, n: progress(70 + int(20 * (i - 1) / max(n, 1)),
                                             f"تحلیل هوشمند دسته {i} از {n}"))
         warnings.extend(analysis["errors"])
+        for item in records:
+            # Text-only AI cannot infer image/video contents from an empty caption.
+            if item["platform"] == "Telegram" and item.get("media_type") in ("photo", "video") and not item.get("title", "").strip():
+                analysis["relevance"][item["id"]] = None
         relevant_all = [r for r in records if analysis["relevance"].get(r["id"]) is True]
-        relevant = [r for r in relevant_all if scheduled_report.valid_post_url(r)]
+        relevant = [r for r in relevant_all if r["platform"] == "Telegram" or scheduled_report.valid_post_url(r)]
         unified = scheduled_report.rank_records(relevant)
         progress(94, "تهیه نتیجه و فایل‌های جامع")
         by_id = {r["id"]: r for r in records}
@@ -445,7 +449,8 @@ def run_scheduled_job(schedule_id):
             score = item.get("relative_score")
             metric = item.get("viral_score") if item["platform"] == "Instagram" else item.get("platform_score") if item["platform"] == "Pinterest" else item.get("views")
             metric_label = {"Instagram": "وایرال", "Pinterest": "امتیاز پین", "Telegram": "بازدید"}[item["platform"]]
-            return f"{position}. {html.escape(item['platform'])} | رتبه نسبی {score} | {metric_label}: {html.escape(str(metric if metric is not None else 'نامشخص'))}\n{title} — <a href=\"{url}\">مشاهده پست</a>"
+            link = f'<a href="{url}">مشاهده پست</a>' if scheduled_report.valid_post_url(item) else "لینک مستقیم موجود نیست"
+            return f"{position}. {html.escape(item['platform'])} | رتبه نسبی {score} | {metric_label}: {html.escape(str(metric if metric is not None else 'نامشخص'))}\n{title} — {link}"
 
         lines += ["", "🏆 <b>سه نتیجهٔ برتر مشترک (رتبهٔ نسبی)</b>"]
         if unknown:
@@ -458,8 +463,12 @@ def run_scheduled_job(schedule_id):
             lines += ["", f"📌 <b>برترین‌های {platform}</b>"]
             lines.extend(line(item, i) for i, item in enumerate(items, 1))
             if not items:
-                lines.append("نتیجهٔ مرتبطِ دارای لینک در دسترس نیست.")
-        lines.append("<i>رتبه‌ها نسبی درون هر پلتفرم‌اند، نه وایرال‌اسکور قابل‌مقایسه؛ دادهٔ ناقص و تصمیم AI بر نتیجه اثر دارد.</i>")
+                lines.append("نتیجهٔ مرتبط در دسترس نیست." if platform == "Telegram" else "نتیجهٔ مرتبطِ دارای لینک در دسترس نیست.")
+        unknown_tg_media = [r for r in unknown if r["platform"] == "Telegram" and r.get("media_type") in ("photo", "video")]
+        tg_media_count = sum(r["platform"] == "Telegram" and r.get("media_type") in ("photo", "video") for r in relevant_all + unknown)
+        if tg_media_count:
+            lines += ["", f"📷 {tg_media_count} رسانهٔ مرتبط یا نامشخص تلگرام ثبت شد؛ حداکثر ۳ مورد جداگانه ارسال می‌شود."]
+        lines.append("<i>رتبه‌ها نسبی درون هر پلتفرم‌اند، نه وایرال‌اسکور قابل‌مقایسه. AI فقط متن و آمار را بررسی می‌کند، نه محتوای تصویر/ویدئو.</i>")
         if warnings:
             lines += ["", "⚠️ <b>محدودیت‌ها و خطاها</b>", *["• " + html.escape(str(w)[:180]) for w in warnings[:3]]]
         # Report uses the final set of ranked records, including raw source data.
@@ -476,6 +485,34 @@ def run_scheduled_job(schedule_id):
         if heartbeat:
             heartbeat.join(timeout=5)
         bot.edit_message_text("\n".join(lines), chat_id, status_msg.message_id, disable_web_page_preview=True)
+        # Send up to three Telegram media separately; absence of a permalink
+        # must never exclude a post from statistics or ranking.
+        tg_media = [r for r in unified if r["platform"] == "Telegram" and r.get("media_type") in ("photo", "video")]
+        tg_media.extend(sorted(unknown_tg_media, key=lambda r: -(r.get("views") or 0)))
+        for index, item in enumerate(tg_media[:3], 1):
+            flag = analysis["relevance"].get(item["id"])
+            status = "مرتبط بر اساس متن" if flag is True else "ارتباط نامشخص؛ بررسی دستی لازم است"
+            caption = (f"📡 <b>رسانهٔ Telegram #{index}</b> | {html.escape(status)}\n"
+                       f"{html.escape(str(item.get('channel_title') or 'کانال نامشخص')[:100])}\n"
+                       f"{html.escape(str(item.get('title') or 'بدون متن')[:300])}")
+            try:
+                content, error = search_service.fetch_telegram_media(item)
+                if error:
+                    warnings.append(f"رسانه Telegram {index}: {error}")
+                    bot.send_message(chat_id, caption + "\n⚠️ رسانه قابل ارسال نیست: " + html.escape(error))
+                else:
+                    data = io.BytesIO(content)
+                    data.name = f"telegram_{index}.{'jpg' if item['media_type'] == 'photo' else 'mp4'}"
+                    if item["media_type"] == "photo":
+                        bot.send_photo(chat_id, data, caption=caption)
+                    else:
+                        bot.send_video(chat_id, data, caption=caption)
+            except Exception as exc:
+                warnings.append(f"رسانه Telegram {index}: {type(exc).__name__}")
+                try:
+                    bot.send_message(chat_id, caption + "\n⚠️ ارسال رسانه ناموفق بود.")
+                except Exception:
+                    pass
         if records:
             data = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
             data.name = f"trend_{schedule_id}_full.json"

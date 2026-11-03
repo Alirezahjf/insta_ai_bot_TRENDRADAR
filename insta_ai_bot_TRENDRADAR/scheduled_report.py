@@ -38,6 +38,9 @@ def build_records(instagram, pinterest, telegram_report, grouped_comments=None):
     for post in getattr(telegram_report, "posts", []) or []:
         records.append({"id": f"telegram:{len(records)+1}", "platform": "Telegram", "url": _clean_url(post.url),
                         "title": (post.text or "")[:500], "views": post.views,
+                        "media_type": post.media_type.value, "channel_uid": post.channel_uid,
+                        "message_id": post.message_id, "channel_title": post.channel_title,
+                        "peer_type": post.extra.get("peer_type", "PeerChannel"),
                         "reactions": post.reactions, "forwards": post.forwards,
                         "raw": post.to_dict()})
     return records

@@ -190,3 +190,67 @@ async def _discover_and_join(radar, hashtags, *, progress=None):
             break
     notes.append(f"عضویت خودکار: {joined} کانال در این اجرا؛ دسترسی و نتیجه تضمین نمی‌شود.")
     return notes
+
+
+async def _read_telegram_media(radar, item, *, max_bytes=45 * 1024 * 1024):
+    """Read an accessible, unprotected photo/video in bounded memory.
+
+    No export from chats with Telegram forwarding restrictions. No disk cache.
+    """
+    from telethon import utils
+    from telethon.tl.types import PeerChannel, PeerChat, PeerUser
+    provider = radar.provider("telegram")
+    await provider.connect()
+    uid = str(item.get("channel_uid") or "")
+    if not uid.startswith("telegram:"):
+        return None, "شناسهٔ کانال معتبر نیست"
+    try:
+        native_id = int(uid.split(":", 1)[1])
+        message_id = int(item["message_id"])
+    except (ValueError, KeyError, TypeError):
+        return None, "شناسهٔ پیام معتبر نیست"
+    client = provider.tg.raw
+    try:
+        peer_types = {"PeerChannel": PeerChannel, "PeerChat": PeerChat, "PeerUser": PeerUser}
+        peer_type = item.get("peer_type", "PeerChannel")
+        if peer_type not in peer_types:
+            return None, "نوع منبع پیام مشخص نیست"
+        entity = await client.get_input_entity(utils.get_peer_id(peer_types[peer_type](native_id)))
+        chat = await client.get_entity(entity)
+        if getattr(chat, "noforwards", False):
+            return None, "کانال انتقال محتوا را محدود کرده است"
+        msg = await client.get_messages(entity, ids=message_id)
+        if msg is None or not getattr(msg, "media", None):
+            return None, "پیام یا رسانه در دسترس نیست"
+        if getattr(msg, "noforwards", False):
+            return None, "انتقال این پیام محدود شده است"
+        file_info = getattr(msg, "file", None)
+        size = getattr(file_info, "size", None)
+        if size is not None and size > max_bytes:
+            return None, "حجم رسانه از سقف ۴۵ مگابایت بیشتر است"
+        data = bytearray()
+        async for chunk in client.iter_download(msg.media, request_size=512 * 1024):
+            if len(data) + len(chunk) > max_bytes:
+                return None, "حجم رسانه از سقف ۴۵ مگابایت بیشتر است"
+            data.extend(chunk)
+        if not data:
+            return None, "رسانه خالی است"
+        return bytes(data), ""
+    except Exception as exc:
+        return None, f"دسترسی یا دریافت رسانه ناموفق ({type(exc).__name__})"
+
+
+def fetch_telegram_media(item):
+    """Use the shared Telethon session without overlapping a scan or join."""
+    with _radar_lock:
+        radar = _radar
+    if radar is None:
+        return None, "سشن جست‌وجوی تلگرام در دسترس نیست"
+    if not _telegram_scan_lock.acquire(timeout=15):
+        return None, "تلگرام مشغول اجرای دیگری است"
+    try:
+        return radar._run_async(asyncio.wait_for(_read_telegram_media(radar, item), timeout=90))
+    except Exception as exc:
+        return None, f"دریافت رسانه ناموفق ({type(exc).__name__})"
+    finally:
+        _telegram_scan_lock.release()
